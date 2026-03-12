@@ -74,10 +74,10 @@ fn main() {
                     .and_then(|line| line.split('=').nth(1))
                     .map(|v| v.trim().to_string())
             })
-            .unwrap_or_else(|| "v0.2.8".to_string());
+            .unwrap_or_else(|| "v0.0.1".to_string());
         
         let download_url = format!(
-            "https://github.com/augusthindenes/inf3200/releases/download/{}/run-node.sh",
+            "https://github.com/VikingTheDev/inf3203/releases/download/{}/run-node.sh",
             version
         );
         

@@ -4,10 +4,10 @@ set -Eeuo pipefail
 # Load version from .env if it exists and GITHUB_TARBALL_URL is not set
 if [ -z "${GITHUB_TARBALL_URL:-}" ] && [ -f "$(dirname "$0")/../.env" ]; then
     source "$(dirname "$0")/../.env"
-    GITHUB_TARBALL_URL="https://github.com/augusthindenes/inf3200/releases/download/${VERSION}/deploy-x86_64-unknown-linux-musl.tar.gz"
+    GITHUB_TARBALL_URL="https://github.com/VikingTheDev/inf3203/releases/download/${VERSION}/deploy-x86_64-unknown-linux-musl.tar.gz"
 fi
 
-GITHUB_TARBALL_URL="${GITHUB_TARBALL_URL:-https://github.com/augusthindenes/inf3200/releases/download/v0.2.8/deploy-x86_64-unknown-linux-musl.tar.gz}"
+GITHUB_TARBALL_URL="${GITHUB_TARBALL_URL:-https://github.com/VikingTheDev/inf3203/releases/download/v0.2.8/deploy-x86_64-unknown-linux-musl.tar.gz}"
 
 usage() {
     echo "Usage: $0 <nodes>"
