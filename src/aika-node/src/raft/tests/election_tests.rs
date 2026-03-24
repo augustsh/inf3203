@@ -4,7 +4,7 @@ use tokio::sync::Mutex;
 use crate::raft::{
     RaftNode, election,
     log::RaftLog,
-    rpc::{AppendEntriesReply, RequestVoteArgs, RequestVoteReply},
+    rpc::{RequestVoteArgs, RequestVoteReply},
     state::{RaftState, Role},
     storage::RaftStorage,
 };

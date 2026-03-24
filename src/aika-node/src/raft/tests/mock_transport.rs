@@ -5,7 +5,6 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::raft::{
-    log::LogEntry,
     rpc::{
         AppendEntriesArgs, AppendEntriesReply, RaftTransport, RequestVoteArgs, RequestVoteReply,
         TransportError,
@@ -15,9 +14,9 @@ use crate::raft::{
 
 /// A controllable in-process transport for Raft unit tests.
 ///
-/// Call `queue_vote_reply` / `queue_append_entries_reply` before sending RPCs
-/// to pre-program what the "network" returns.  Use `sent_vote_requests` /
-/// `sent_append_entries` to assert on what was actually sent.
+/// Call `queue_append_entries_reply` before sending RPCs to pre-program what
+/// the "network" returns.  Use `sent_vote_requests` / `sent_append_entries`
+/// to assert on what was actually sent.
 ///
 /// Replies are consumed FIFO per peer.  If no reply is queued for a peer,
 /// the call returns `TransportError::Unreachable`.
@@ -37,17 +36,6 @@ impl<C: Clone + Send + Sync + Serialize + for<'de> Deserialize<'de> + 'static> M
             sent_vote_requests: Mutex::new(Vec::new()),
             sent_append_entries: Mutex::new(Vec::new()),
         })
-    }
-
-    /// Queue a reply that will be returned the next time `send_request_vote`
-    /// is called for `peer`.
-    pub fn queue_vote_reply(&self, peer: &str, reply: Result<RequestVoteReply, TransportError>) {
-        self.vote_replies
-            .lock()
-            .unwrap()
-            .entry(peer.to_string())
-            .or_default()
-            .push_back(reply);
     }
 
     /// Queue a reply that will be returned the next time `send_append_entries`

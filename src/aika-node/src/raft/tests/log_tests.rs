@@ -1,14 +1,6 @@
 use crate::raft::log::{LogEntry, RaftLog};
 
 // region Helpers
-fn entry(term: u64, index: u64) -> LogEntry<u32> {
-    LogEntry {
-        term,
-        index,
-        command: 0,
-    }
-}
-
 fn log_with(pairs: &[(u64, u64)]) -> RaftLog<u32> {
     // pairs: (term, index)
     let mut log = RaftLog::new();
