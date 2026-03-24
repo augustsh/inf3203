@@ -413,6 +413,7 @@ fn main() {
         let node_args = format!(
             "cluster-controller --node-id {} --bind 0.0.0.0:{} --peers {} --image-dir {} \
              --data-dir {} --results-dir {} \
+             --batch-size 4 --task-ttl-secs 600 \
              --heartbeat-interval-ms 500 --election-timeout-min-ms 2000 --election-timeout-max-ms 5000",
             node_id, port, peer_list, IMAGE_DIR, data_dir, results_dir_str
         );
