@@ -13,6 +13,7 @@ use rand::Rng;
 use rand::seq::SliceRandom;
 use std::env;
 use std::fs;
+use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -111,6 +112,8 @@ fn find_free_port(node: &str, max_attempts: u32) -> Option<u16> {
 fn ssh_run(node: &str, cmd: &str) -> bool {
     Command::new("ssh")
         .args([
+            "-n", // do not read stdin; prevents SSH from keeping the connection
+            // open waiting for the deploy process's terminal
             "-o",
             "BatchMode=yes",
             "-o",
@@ -120,6 +123,8 @@ fn ssh_run(node: &str, cmd: &str) -> bool {
             node,
         ])
         .arg(cmd)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .map(|s| s.success())
         .unwrap_or_else(|e| {
@@ -358,6 +363,7 @@ fn main() {
             data_dir, binary_str, node_args
         );
         print!("  CC{} @ {}:{}  … ", node_id, node, port);
+        let _ = std::io::stdout().flush();
         if ssh_run(node, &cmd) {
             println!("ok");
             cc_started.push(format!("{}:{}", node, port));
@@ -425,6 +431,7 @@ fn main() {
             );
 
             print!("  LC [{}] {} @ {}:{}  … ", label, node_id, node, port);
+            let _ = std::io::stdout().flush();
             if ssh_start(node, binary_str, &lc_args) {
                 println!("ok");
                 lc_started += 1;
@@ -810,6 +817,7 @@ fn run_cleanup(cwd: &Path) {
         let pattern = format!("/tmp/inf3203_{}_*", username);
         let cmd = format!("rm -rf {}", pattern);
         print!("  {} … ", node);
+        let _ = std::io::stdout().flush();
         if ssh_run(node, &cmd) {
             println!("ok");
             ok += 1;
