@@ -203,15 +203,22 @@ where
                     }
                 }
 
-                if resp.status().is_success() {
+                let status = resp.status();
+
+                if status == reqwest::StatusCode::OK {
                     return Ok(resp.json::<R>().await?);
+                }
+
+                // 204 No Content → no work available; not a leader problem.
+                if status == reqwest::StatusCode::NO_CONTENT {
+                    anyhow::bail!("no work available");
                 }
 
                 tracing::warn!(
                     "Proxy attempt {}/2 to {} returned {}",
                     attempt + 1,
                     path,
-                    resp.status()
+                    status
                 );
             }
             Err(e) => {

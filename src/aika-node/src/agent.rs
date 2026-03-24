@@ -124,7 +124,7 @@ async fn request_task(
     // Try the local controller first.
     let lc_url = format!("http://{}/agent/request_task", config.lc_addr);
     match client.post(&lc_url).json(&body).send().await {
-        Ok(resp) if resp.status().is_success() => {
+        Ok(resp) if resp.status() == reqwest::StatusCode::OK => {
             return Ok(resp.json::<TaskAssignment>().await?);
         }
         Ok(resp) => {
@@ -147,7 +147,7 @@ async fn request_task(
     for cc_addr in &config.cc_addrs {
         let url = format!("http://{}/task/request", cc_addr);
         match client.post(&url).json(&body).send().await {
-            Ok(resp) if resp.status().is_success() => {
+            Ok(resp) if resp.status() == reqwest::StatusCode::OK => {
                 return Ok(resp.json::<TaskAssignment>().await?);
             }
             Ok(resp) => {
