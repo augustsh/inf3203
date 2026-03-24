@@ -30,6 +30,12 @@ pub struct ClusterControllerConfig {
     pub data_dir: String,
     /// Directory for writing the results NDJSON file (can be on NFS).
     pub results_dir: String,
+    /// Raft heartbeat interval in milliseconds.
+    pub heartbeat_interval_ms: u64,
+    /// Minimum Raft election timeout in milliseconds.
+    pub election_timeout_min_ms: u64,
+    /// Maximum Raft election timeout in milliseconds.
+    pub election_timeout_max_ms: u64,
 }
 
 // endregion
@@ -118,6 +124,7 @@ impl StateMachine {
                         agent_count: 0,
                         extractor_script: String::new(),
                         image_base_path: String::new(),
+                        python: String::new(),
                     });
             }
 
@@ -224,7 +231,20 @@ pub async fn run(config: ClusterControllerConfig) -> anyhow::Result<()> {
 
     // Node-local Raft storage (must NOT be a shared/distributed filesystem).
     let data_dir = std::path::PathBuf::from(&config.data_dir).join("raft");
-    let raft = RaftNode::new(config.node_id, config.peers, data_dir);
+    let election_config = crate::raft::election::ElectionConfig {
+        timeout_min: Duration::from_millis(config.election_timeout_min_ms),
+        timeout_max: Duration::from_millis(config.election_timeout_max_ms),
+    };
+    let replication_config = crate::raft::replication::ReplicationConfig {
+        heartbeat_interval: Duration::from_millis(config.heartbeat_interval_ms),
+    };
+    let raft = RaftNode::new(
+        config.node_id,
+        config.peers,
+        data_dir,
+        election_config,
+        replication_config,
+    );
     let sm: Arc<Mutex<StateMachine>> = Arc::new(Mutex::new(StateMachine::new()));
 
     // Register the state machine's apply function as a Raft commit callback.
@@ -419,6 +439,7 @@ async fn handle_heartbeat(
                 agent_count: 0,
                 extractor_script: String::new(),
                 image_base_path: String::new(),
+                python: String::new(),
             });
         entry.last_heartbeat = unix_now();
         entry.agent_ids = request.agent_ids;
@@ -426,6 +447,7 @@ async fn handle_heartbeat(
         entry.agent_count = request.agent_count;
         entry.extractor_script = request.extractor_script;
         entry.image_base_path = request.image_base_path;
+        entry.python = request.python;
     }
 
     Ok(Json(HeartbeatResponse { acknowledged: true }))
@@ -679,6 +701,7 @@ async fn lc_monitor_loop(app: AppState) {
                     agent_count: node.agent_count.max(1),
                     extractor_script: node.extractor_script.clone(),
                     image_base_path: node.image_base_path.clone(),
+                    python: node.python.clone(),
                 };
                 let url = format!("http://{}/activate", replica.address);
                 match client.post(&url).json(&req).send().await {

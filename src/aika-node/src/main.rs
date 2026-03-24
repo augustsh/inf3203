@@ -56,6 +56,20 @@ enum Role {
         /// Defaults to $HOME/inf3203_data
         #[arg(long)]
         results_dir: Option<String>,
+
+        /// Raft heartbeat interval in milliseconds (leader → followers).
+        /// Must be well below the election timeout minimum.
+        #[arg(long, default_value = "50")]
+        heartbeat_interval_ms: u64,
+
+        /// Minimum Raft election timeout in milliseconds.
+        /// Increase for clusters with higher network latency.
+        #[arg(long, default_value = "150")]
+        election_timeout_min_ms: u64,
+
+        /// Maximum Raft election timeout in milliseconds.
+        #[arg(long, default_value = "300")]
+        election_timeout_max_ms: u64,
     },
 
     /// Run as a local controller (monitors agents on this physical node)
@@ -87,6 +101,10 @@ enum Role {
         /// Base path where the unlabeled images reside (passed to spawned agents)
         #[arg(long, default_value = "/share/inf3203/unlabeled_images")]
         image_base_path: String,
+
+        /// Path to the Python interpreter to use for feature extraction (e.g. venv python)
+        #[arg(long, default_value = "python3")]
+        python: String,
     },
 
     /// Run as a worker agent (usually spawned by a local controller)
@@ -110,6 +128,10 @@ enum Role {
         /// Base path where the unlabeled images reside
         #[arg(long, default_value = "/share/inf3203/unlabeled_images")]
         image_base_path: String,
+
+        /// Path to the Python interpreter to use for feature extraction (e.g. venv python)
+        #[arg(long, default_value = "python3")]
+        python: String,
     },
 }
 
@@ -133,6 +155,9 @@ async fn main() -> anyhow::Result<()> {
             lc_heartbeat_timeout_secs,
             data_dir,
             results_dir,
+            heartbeat_interval_ms,
+            election_timeout_min_ms,
+            election_timeout_max_ms,
         } => {
             let username = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
             let data_dir =
@@ -152,6 +177,9 @@ async fn main() -> anyhow::Result<()> {
                 lc_heartbeat_timeout_secs,
                 data_dir,
                 results_dir,
+                heartbeat_interval_ms,
+                election_timeout_min_ms,
+                election_timeout_max_ms,
             };
             cluster_controller::run(config).await
         }
@@ -164,6 +192,7 @@ async fn main() -> anyhow::Result<()> {
             health_check_interval,
             extractor_script,
             image_base_path,
+            python,
         } => {
             let config = local_controller::LocalControllerConfig {
                 node_id,
@@ -173,6 +202,7 @@ async fn main() -> anyhow::Result<()> {
                 health_check_interval,
                 extractor_script,
                 image_base_path,
+                python,
             };
             local_controller::run(config).await
         }
@@ -183,6 +213,7 @@ async fn main() -> anyhow::Result<()> {
             cc_addrs,
             extractor_script,
             image_base_path,
+            python,
         } => {
             let config = agent::AgentConfig {
                 agent_id,
@@ -190,6 +221,7 @@ async fn main() -> anyhow::Result<()> {
                 cc_addrs,
                 extractor_script,
                 image_base_path,
+                python,
             };
             agent::run(config).await
         }

@@ -14,6 +14,7 @@ pub struct LocalControllerConfig {
     pub health_check_interval: u64,
     pub extractor_script: String,
     pub image_base_path: String,
+    pub python: String,
 }
 
 /// Tracks the state of a locally managed agent process.
@@ -82,7 +83,7 @@ pub async fn run(config: LocalControllerConfig) -> anyhow::Result<()> {
     // No other tasks are running yet so holding the lock here is fine.
     if agent_count > 0 {
         // Extract config data without holding the lock during the spawn syscalls.
-        let (node_id, lc_port, cc_addrs, extractor_script, image_base_path) = {
+        let (node_id, lc_port, cc_addrs, extractor_script, image_base_path, python) = {
             let g = state.lock().await;
             (
                 g.config.node_id.clone(),
@@ -90,6 +91,7 @@ pub async fn run(config: LocalControllerConfig) -> anyhow::Result<()> {
                 g.config.cc_addrs.clone(),
                 g.config.extractor_script.clone(),
                 g.config.image_base_path.clone(),
+                g.config.python.clone(),
             )
         };
         let lc_addr = format!("127.0.0.1:{}", lc_port);
@@ -103,6 +105,7 @@ pub async fn run(config: LocalControllerConfig) -> anyhow::Result<()> {
                 &cc_addrs,
                 &extractor_script,
                 &image_base_path,
+                &python,
             ) {
                 Ok(agent) => {
                     tracing::info!("Spawned agent {}", agent_id);
@@ -234,6 +237,7 @@ fn spawn_agent(
     cc_addrs: &[String],
     extractor_script: &str,
     image_base_path: &str,
+    python: &str,
 ) -> anyhow::Result<ManagedAgent> {
     let exe = std::env::current_exe()
         .map_err(|e| anyhow::anyhow!("Cannot determine current executable: {}", e))?;
@@ -250,6 +254,8 @@ fn spawn_agent(
         .arg(extractor_script)
         .arg("--image-base-path")
         .arg(image_base_path)
+        .arg("--python")
+        .arg(python)
         .spawn()
         .map_err(|e| anyhow::anyhow!("Failed to spawn agent process: {}", e))?;
 
@@ -273,13 +279,14 @@ async fn agent_health_loop(app: AppState, interval_secs: u64) {
 
         // Collect IDs of dead agents and config data needed for respawning —
         // all under a single short-lived lock.
-        let (dead_ids, lc_addr, cc_addrs, extractor_script, image_base_path) = {
+        let (dead_ids, lc_addr, cc_addrs, extractor_script, image_base_path, python) = {
             let mut g = app.state.lock().await;
             let lc_port = g.config.bind.port();
             let lc_addr = format!("127.0.0.1:{}", lc_port);
             let cc_addrs = g.config.cc_addrs.clone();
             let extractor_script = g.config.extractor_script.clone();
             let image_base_path = g.config.image_base_path.clone();
+            let python = g.config.python.clone();
 
             let mut dead_ids = Vec::new();
             for (id, agent) in g.agents.iter_mut() {
@@ -303,6 +310,7 @@ async fn agent_health_loop(app: AppState, interval_secs: u64) {
                 cc_addrs,
                 extractor_script,
                 image_base_path,
+                python,
             )
         }; // Lock released before spawning.
 
@@ -315,6 +323,7 @@ async fn agent_health_loop(app: AppState, interval_secs: u64) {
                 &cc_addrs,
                 &extractor_script,
                 &image_base_path,
+                &python,
             ) {
                 Ok(agent) => {
                     tracing::info!("Respawned agent {}", agent_id);
@@ -340,7 +349,7 @@ async fn heartbeat_loop(app: AppState) {
         tokio::time::sleep(Duration::from_secs(10)).await;
 
         // Collect the data we need from state (brief lock, no I/O).
-        let (node_id, bind_addr, agent_ids, load, agent_count, extractor_script, image_base_path) = {
+        let (node_id, bind_addr, agent_ids, load, agent_count, extractor_script, image_base_path, python) = {
             let g = app.state.lock().await;
             let agent_ids: Vec<String> = g.agents.keys().cloned().collect();
             let in_flight = g
@@ -361,6 +370,7 @@ async fn heartbeat_loop(app: AppState) {
                 g.config.agent_count,
                 g.config.extractor_script.clone(),
                 g.config.image_base_path.clone(),
+                g.config.python.clone(),
             )
         };
 
@@ -372,6 +382,7 @@ async fn heartbeat_loop(app: AppState) {
             agent_count,
             extractor_script,
             image_base_path,
+            python,
         };
 
         // find_leader + HTTP POST happen without holding the mutex.
@@ -437,6 +448,7 @@ async fn handle_activate(
     g.config.agent_count = req.agent_count;
     g.config.extractor_script = req.extractor_script.clone();
     g.config.image_base_path = req.image_base_path.clone();
+    g.config.python = req.python.clone();
 
     let lc_addr = format!("127.0.0.1:{}", g.config.bind.port());
     let cc_addrs = g.config.cc_addrs.clone();
@@ -454,6 +466,7 @@ async fn handle_activate(
             &cc_addrs,
             &req.extractor_script,
             &req.image_base_path,
+            &req.python,
         ) {
             Ok(agent) => {
                 tracing::info!("Spawned agent {}", agent_id);

@@ -8,6 +8,7 @@ pub struct AgentConfig {
     pub cc_addrs: Vec<String>,
     pub extractor_script: String,
     pub image_base_path: String,
+    pub python: String,
 }
 
 /// Main entry point for the agent worker.
@@ -241,7 +242,7 @@ async fn process_batch(
 
     for image_path in &assignment.image_paths {
         let full_path = format!("{}/{}", config.image_base_path, image_path);
-        let label = run_feature_extractor(&config.extractor_script, &full_path).await?;
+        let label = run_feature_extractor(&config.python, &config.extractor_script, &full_path).await?;
         results.push((image_path.clone(), label));
     }
 
@@ -250,13 +251,13 @@ async fn process_batch(
 
 /// Run the provided Python feature extraction script on a single image.
 /// Returns the predicted label (the trimmed first line of stdout).
-async fn run_feature_extractor(script_path: &str, image_path: &str) -> anyhow::Result<String> {
-    let output = tokio::process::Command::new("python3")
+async fn run_feature_extractor(python: &str, script_path: &str, image_path: &str) -> anyhow::Result<String> {
+    let output = tokio::process::Command::new(python)
         .arg(script_path)
         .arg(image_path)
         .output()
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to spawn python3: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to spawn {}: {}", python, e))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

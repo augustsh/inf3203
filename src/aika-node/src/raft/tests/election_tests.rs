@@ -2,8 +2,10 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::raft::{
-    RaftNode, election,
+    RaftNode,
+    election::{self, ElectionConfig},
     log::RaftLog,
+    replication::ReplicationConfig,
     rpc::{RequestVoteArgs, RequestVoteReply},
     state::{RaftState, Role},
     storage::RaftStorage,
@@ -45,6 +47,8 @@ fn make_raft_node(id: u64, peers: &[&str]) -> (RaftNode, tempfile::TempDir) {
         id,
         peers.iter().map(|s| s.to_string()).collect(),
         dir.path().to_path_buf(),
+        ElectionConfig::default(),
+        ReplicationConfig::default(),
     );
     (node, dir)
 }

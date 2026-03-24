@@ -143,6 +143,53 @@ fn ssh_start(node: &str, binary: &str, args: &str, log_file: &str) -> bool {
     ssh_run(node, &cmd)
 }
 
+/// Ensure a Python virtual environment with the required packages exists in
+/// `install_dir/inf3203_venv`. Returns the path to the venv's `python` binary.
+fn ensure_venv(install_dir: &Path, classify_script: &Path) -> PathBuf {
+    let venv_dir = install_dir.join("inf3203_venv");
+    let python = venv_dir.join("bin/python");
+
+    if python.exists() {
+        println!("venv already present: {}", venv_dir.display());
+        return python;
+    }
+
+    println!("Creating Python venv at {}…", venv_dir.display());
+    let status = Command::new("python3")
+        .args(["-m", "venv"])
+        .arg(&venv_dir)
+        .status()
+        .expect("python3 not found — cannot create venv");
+    if !status.success() {
+        eprintln!("Failed to create venv");
+        std::process::exit(1);
+    }
+
+    // Derive requirements.txt path: it lives next to classify.py
+    let requirements = classify_script.parent().unwrap_or(install_dir).join("requirements.txt");
+    if requirements.exists() {
+        println!("Installing packages from {}…", requirements.display());
+        let pip = venv_dir.join("bin/pip");
+        let status = Command::new(&pip)
+            .args(["install", "-r"])
+            .arg(&requirements)
+            .status()
+            .expect("pip not found in venv");
+        if !status.success() {
+            eprintln!("pip install failed");
+            std::process::exit(1);
+        }
+    } else {
+        eprintln!(
+            "Warning: requirements.txt not found at {}",
+            requirements.display()
+        );
+    }
+
+    println!("venv ready: {}", python.display());
+    python
+}
+
 /// Ensure `classify.py` is present in `install_dir`. If not download from GitHub.
 fn ensure_classify_script(install_dir: &Path) -> PathBuf {
     let dest = install_dir.join("classify.py");
@@ -285,6 +332,9 @@ fn main() {
     let classify_script = ensure_classify_script(&cwd);
     let classify_script_str = classify_script.to_str().expect("non-UTF8 path");
 
+    let venv_python = ensure_venv(&cwd, &classify_script);
+    let venv_python_str = venv_python.to_str().expect("non-UTF8 path");
+
     // Create the results directory on the shared filesystem so all CC nodes can
     // write their NDJSON output to a single accessible location.
     let results_dir = cwd.join("inf3203_data");
@@ -362,7 +412,8 @@ fn main() {
         let data_dir = format!("/tmp/inf3203_{}_{}", username, node_id);
         let node_args = format!(
             "cluster-controller --node-id {} --bind 0.0.0.0:{} --peers {} --image-dir {} \
-             --data-dir {} --results-dir {}",
+             --data-dir {} --results-dir {} \
+             --heartbeat-interval-ms 500 --election-timeout-min-ms 2000 --election-timeout-max-ms 5000",
             node_id, port, peer_list, IMAGE_DIR, data_dir, results_dir_str
         );
         let log_file = format!("{}/cc-{}.log", log_dir_str, node_id);
@@ -428,15 +479,15 @@ fn main() {
             let node_id = format!("lc-{}", node);
             let lc_args = format!(
                 "local-controller --node-id {} --bind 0.0.0.0:{} --cc-addrs {} \
-                 --agents {} --extractor-script {} --image-base-path {}",
-                node_id, port, peer_list, agents, classify_script_str, IMAGE_DIR
+                 --agents {} --extractor-script {} --image-base-path {} --python {}",
+                node_id, port, peer_list, agents, classify_script_str, IMAGE_DIR, venv_python_str
             );
             // Watchdog always restarts as a standby replica (--agents 0)
             // to replace the old replica that CC promoted
             let restart_args = format!(
                 "local-controller --node-id {} --bind 0.0.0.0:{} --cc-addrs {} \
-                 --agents 0 --extractor-script {} --image-base-path {}",
-                node_id, port, peer_list, classify_script_str, IMAGE_DIR
+                 --agents 0 --extractor-script {} --image-base-path {} --python {}",
+                node_id, port, peer_list, classify_script_str, IMAGE_DIR, venv_python_str
             );
 
             let log_file = format!("{}/lc-{}.log", log_dir_str, node);
@@ -490,6 +541,7 @@ fn main() {
             classify_script: classify_script_str.to_string(),
             peer_list: peer_list.clone(),
             log_dir: log_dir_str,
+            python: venv_python_str.to_string(),
         };
         lc_watchdog(lc_watchlist, cc_watchlist, ctx);
     }
@@ -521,6 +573,7 @@ struct WatchdogContext {
     classify_script: String,
     peer_list: String,
     log_dir: String,
+    python: String,
 }
 
 /// One entry in the watchdog's tracking list.
@@ -682,8 +735,8 @@ fn lc_watchdog(
             let node_id = format!("lc-{}", new_node);
             let new_restart_args = format!(
                 "local-controller --node-id {} --bind 0.0.0.0:{} --cc-addrs {} \
-                 --agents 0 --extractor-script {} --image-base-path {}",
-                node_id, port, ctx.peer_list, ctx.classify_script, IMAGE_DIR
+                 --agents 0 --extractor-script {} --image-base-path {} --python {}",
+                node_id, port, ctx.peer_list, ctx.classify_script, IMAGE_DIR, ctx.python
             );
 
             eprintln!(

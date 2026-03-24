@@ -72,6 +72,7 @@ pub struct NodeInfo {
     pub agent_count: usize,
     pub extractor_script: String,
     pub image_base_path: String,
+    pub python: String,
 }
 
 // endregion
@@ -118,6 +119,7 @@ pub struct HeartbeatRequest {
     pub agent_count: usize,
     pub extractor_script: String,
     pub image_base_path: String,
+    pub python: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -160,6 +162,7 @@ pub struct ActivateRequest {
     pub agent_count: usize,
     pub extractor_script: String,
     pub image_base_path: String,
+    pub python: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

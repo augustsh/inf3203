@@ -94,7 +94,13 @@ impl RaftNode {
     ///
     /// `data_dir` must be a node-local path (e.g. `/tmp/inf3203_raft_<node_id>/`).
     /// It must **not** be on a shared/distributed filesystem.
-    pub fn new(node_id: u64, peers: Vec<String>, data_dir: std::path::PathBuf) -> Self {
+    pub fn new(
+        node_id: u64,
+        peers: Vec<String>,
+        data_dir: std::path::PathBuf,
+        election_config: ElectionConfig,
+        replication_config: ReplicationConfig,
+    ) -> Self {
         let own_node_id: NodeId = node_id.to_string();
 
         // Assign each peer a stable u64 equal to its index in the input slice.
@@ -159,7 +165,7 @@ impl RaftNode {
 
         // --- Election timer --------------------------------------------------
         let timer = Arc::new(ElectionTimer::start(
-            ElectionConfig::default(),
+            election_config,
             election_timeout_tx,
         ));
 
@@ -276,7 +282,7 @@ impl RaftNode {
                                     Arc::clone(&el_log),
                                     Arc::clone(&el_transport),
                                     Arc::clone(&el_storage),
-                                    ReplicationConfig::default(),
+                                    replication_config.clone(),
                                     Arc::clone(&el_commit_notify),
                                     sd_rx,
                                 ).await;
