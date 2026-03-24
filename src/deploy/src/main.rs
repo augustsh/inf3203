@@ -134,8 +134,12 @@ fn ssh_run(node: &str, cmd: &str) -> bool {
 }
 
 /// SSH to `node` and start an Aika node as a detached background process.
-fn ssh_start(node: &str, binary: &str, args: &str) -> bool {
-    let cmd = format!("nohup {} {} </dev/null >/dev/null 2>&1 &", binary, args);
+/// stdout and stderr are appended to `log_file` (must be an NFS path visible from the remote node).
+fn ssh_start(node: &str, binary: &str, args: &str, log_file: &str) -> bool {
+    let cmd = format!(
+        "nohup {} {} </dev/null >>{} 2>&1 &",
+        binary, args, log_file
+    );
     ssh_run(node, &cmd)
 }
 
@@ -287,6 +291,10 @@ fn main() {
     fs::create_dir_all(&results_dir).expect("failed to create inf3203_data dir");
     let results_dir_str = results_dir.to_str().expect("non-UTF8 path");
 
+    let log_dir = results_dir.join("logs");
+    fs::create_dir_all(&log_dir).expect("failed to create logs dir");
+    let log_dir_str = log_dir.to_str().expect("non-UTF8 path").to_string();
+
     let gpu_nodes = gpu_node_hostnames();
 
     // Get currently available non-gpu nodes
@@ -357,10 +365,11 @@ fn main() {
              --data-dir {} --results-dir {}",
             node_id, port, peer_list, IMAGE_DIR, data_dir, results_dir_str
         );
+        let log_file = format!("{}/cc-{}.log", log_dir_str, node_id);
         // Wipe old Raft state on the target node (start fresh every time we deploy new cluster)
         let cmd = format!(
-            "rm -rf {} && nohup {} {} </dev/null >/dev/null 2>&1 &",
-            data_dir, binary_str, node_args
+            "rm -rf {} && nohup {} {} </dev/null >>{} 2>&1 &",
+            data_dir, binary_str, node_args, log_file
         );
         print!("  CC{} @ {}:{}  … ", node_id, node, port);
         let _ = std::io::stdout().flush();
@@ -430,9 +439,10 @@ fn main() {
                 node_id, port, peer_list, classify_script_str, IMAGE_DIR
             );
 
+            let log_file = format!("{}/lc-{}.log", log_dir_str, node);
             print!("  LC [{}] {} @ {}:{}  … ", label, node_id, node, port);
             let _ = std::io::stdout().flush();
-            if ssh_start(node, binary_str, &lc_args) {
+            if ssh_start(node, binary_str, &lc_args, &log_file) {
                 println!("ok");
                 lc_started += 1;
                 lc_watchlist.push((node.clone(), binary_str.to_string(), restart_args));
@@ -459,10 +469,12 @@ fn main() {
     println!("══════════════════════════════════════════");
     println!("  Binary:   {}", binary_str);
     println!("  Results:  {}", results_dir_str);
+    println!("  Logs:     {}", log_dir_str);
     println!("  CCs:      {}", cc_started.join("  "));
     println!();
     println!("  Status:   curl http://{}/status", cc_started[0]);
     println!("  Leader:   curl http://{}/leader", cc_started[0]);
+    println!("  Log tail: tail -f {}/*.log", log_dir_str);
     println!();
     println!(
         "  Teardown: xargs -a {} -I{{}} ssh {{}} \"pkill -f inf3203_aika; true\"",
@@ -477,6 +489,7 @@ fn main() {
             binary: binary_str.to_string(),
             classify_script: classify_script_str.to_string(),
             peer_list: peer_list.clone(),
+            log_dir: log_dir_str,
         };
         lc_watchdog(lc_watchlist, cc_watchlist, ctx);
     }
@@ -507,6 +520,7 @@ struct WatchdogContext {
     binary: String,
     classify_script: String,
     peer_list: String,
+    log_dir: String,
 }
 
 /// One entry in the watchdog's tracking list.
@@ -562,7 +576,8 @@ fn lc_watchdog(
             let alive = ssh_run(node, "pgrep -f inf3203_aika > /dev/null 2>&1");
             if !alive {
                 eprintln!("[watchdog] CC on {} not running — restarting…", node);
-                if ssh_start(node, binary, args) {
+                let log_file = format!("{}/cc-{}.log", ctx.log_dir, node);
+                if ssh_start(node, binary, args, &log_file) {
                     eprintln!("[watchdog] CC on {} restarted ok", node);
                 } else {
                     eprintln!(
@@ -609,7 +624,8 @@ fn lc_watchdog(
                 entry.failed_attempts + 1,
                 MAX_RESTART_ATTEMPTS
             );
-            if ssh_start(&entry.node, &ctx.binary, &entry.restart_args) {
+            let log_file = format!("{}/lc-{}.log", ctx.log_dir, entry.node);
+            if ssh_start(&entry.node, &ctx.binary, &entry.restart_args, &log_file) {
                 eprintln!("[watchdog] LC on {} restarted ok", entry.node);
                 entry.down_since = None;
                 entry.failed_attempts = 0;
@@ -674,7 +690,8 @@ fn lc_watchdog(
                 "[watchdog] Starting replacement LC on {} (was {})…",
                 new_node, entry.node
             );
-            if ssh_start(&new_node, &ctx.binary, &new_restart_args) {
+            let log_file = format!("{}/lc-{}.log", ctx.log_dir, new_node);
+            if ssh_start(&new_node, &ctx.binary, &new_restart_args, &log_file) {
                 eprintln!("[watchdog] Replacement LC on {} started ok", new_node);
                 entry.node = new_node;
                 entry.restart_args = new_restart_args;
