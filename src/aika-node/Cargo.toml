@@ -32,7 +32,7 @@ axum = "0.8"
 clap = { version = "4", features = ["derive"] }
 
 # HTTP client used by the RaftTransport implementation to send RPCs to peers
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 anyhow = "1.0.102"
 
 [dev-dependencies]
