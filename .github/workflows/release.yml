@@ -52,9 +52,7 @@ jobs:
           # Update .env file
           echo "VERSION=$TAG" > .env
           
-          # Update scripts with the tag
-          sed -i "s|releases/download/v[0-9]\+\.[0-9]\+\.[0-9]\+/|releases/download/$TAG/|g" src/run.sh
-          sed -i "s|releases/download/v[0-9]\+\.[0-9]\+\.[0-9]\+/|releases/download/$TAG/|g" src/run-node.sh
+          # Update deploy binary with the release tag
           sed -i "s|\"v[0-9]\+\.[0-9]\+\.[0-9]\+\"|\"$TAG\"|g" src/deploy/src/main.rs
           
           # Generate README.md from template
@@ -133,7 +131,7 @@ jobs:
             done
           }
 
-          package_dir "webserver"
+          package_dir "aika-node"
           package_dir "deploy"
 
           # Create checksums for all tarballs
@@ -147,6 +145,5 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/sha256sums.txt
-            src/run.sh
-            src/run-node.sh
-            generate_release_notes: true
+            INF-3203_Assignment/classify.py
+          generate_release_notes: true
