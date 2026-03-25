@@ -145,5 +145,5 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/sha256sums.txt
-            INF-3203_Assignment/classify.py
+            INF-3203_Assignment/batch_classify.py
           generate_release_notes: true
