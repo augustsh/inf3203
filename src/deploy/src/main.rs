@@ -322,7 +322,7 @@ fn main() {
         .output()
         .expect("failed to run /share/ifi/available-nodes.sh");
 
-    let mut candidates: Vec<String> = String::from_utf8_lossy(&raw.stdout)
+    let candidates: Vec<String> = String::from_utf8_lossy(&raw.stdout)
         .lines()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty() && !gpu_nodes.contains(s.as_str()))
@@ -377,8 +377,62 @@ fn main() {
         std::process::exit(1);
     }
 
-    // --- Set up the log buffer that feeds into the TUI ---
+    // --- Set up shared state for TUI + deploy thread ---
     let log_buf = LogBuffer::new(500);
+    let deploy_info: Arc<Mutex<Option<DeployInfo>>> = Arc::new(Mutex::new(None));
+    let dashboard_state = Arc::new(Mutex::new(DashboardState {
+        lc_crashes: 0,
+        lc_restarts: 0,
+        cc_crashes: 0,
+        cc_restarts: 0,
+        lc_replacements: 0,
+        throughput_history: Vec::new(),
+        per_node_history: HashMap::new(),
+        last_status: None,
+        start_time: None,
+        completed_at: None,
+        cc_statuses: Vec::new(),
+        telemetry_file: String::new(),
+        telemetry_saved: false,
+    }));
+
+    // Spawn the deploy work in a background thread so the TUI is live immediately.
+    {
+        let log_buf = log_buf.clone();
+        let deploy_info = Arc::clone(&deploy_info);
+        let dashboard_state = Arc::clone(&dashboard_state);
+        let cwd = cwd.clone();
+        thread::spawn(move || {
+            run_deploy(
+                cwd, num_nodes, num_cc, num_replicas, agents_per_lc,
+                task_ttl_secs, batch_size, max_images, candidates,
+                log_buf, deploy_info, dashboard_state,
+            );
+        });
+    }
+
+    if let Err(e) = dashboard::run_tui(dashboard_state, deploy_info, log_buf) {
+        eprintln!("TUI error: {}", e);
+    }
+}
+
+/// Runs the deploy sequence in a background thread: downloads binaries,
+/// SSH-starts CCs and LCs, then spawns watchdog threads.
+fn run_deploy(
+    cwd: PathBuf,
+    num_nodes: usize,
+    num_cc: usize,
+    num_replicas: usize,
+    agents_per_lc: usize,
+    task_ttl_secs: u64,
+    batch_size: usize,
+    max_images: u64,
+    mut candidates: Vec<String>,
+    log_buf: LogBuffer,
+    deploy_info: Arc<Mutex<Option<DeployInfo>>>,
+    dashboard_state: Arc<Mutex<DashboardState>>,
+) {
+    let args: Vec<String> = env::args().collect();
 
     if max_images > 0 {
         log_buf.push(format!("Image limit: {} images", max_images));
@@ -429,8 +483,8 @@ fn main() {
         match find_free_port(node, 30) {
             Some(port) => cc_assignments.push((node.clone(), port)),
             None => {
-                eprintln!("Could not find a free port on CC node {}.", node);
-                std::process::exit(1);
+                log_buf.push(format!("ERROR: Could not find a free port on CC node {}.", node));
+                return;
             }
         }
     }
@@ -476,13 +530,13 @@ fn main() {
     }
 
     if cc_started.len() < num_cc {
-        eprintln!(
-            "\nOnly {}/{} CCs started — quorum requires all {}. Aborting.",
+        log_buf.push(format!(
+            "ERROR: Only {}/{} CCs started — quorum requires all {}. Aborting.",
             cc_started.len(),
             num_cc,
             num_cc
-        );
-        std::process::exit(1);
+        ));
+        return;
     }
 
     // (node, binary, args) — used by the watchdog to restart crashed LCs.
@@ -510,7 +564,7 @@ fn main() {
             let port = match find_free_port(node, 30) {
                 Some(p) => p,
                 None => {
-                    eprintln!("  No free port on {} — skipping.", node);
+                    log_buf.push(format!("  No free port on {} — skipping.", node));
                     continue;
                 }
             };
@@ -551,7 +605,7 @@ fn main() {
     // save node list and print summary
     let nodes_file = cwd.join(".inf3203_nodes");
     if let Err(e) = fs::write(&nodes_file, nodes.join("\n")) {
-        eprintln!("Warning: could not save node list: {}", e);
+        log_buf.push(format!("Warning: could not save node list: {}", e));
     }
 
     log_buf.push(format!("══════════════════════════════════════════"));
@@ -572,7 +626,7 @@ fn main() {
     log_buf.push(format!("══════════════════════════════════════════"));
 
     if !lc_watchlist.is_empty() {
-        log_buf.push(format!("Watchdog running — TUI active."));
+        log_buf.push(format!("Watchdog active."));
         let ctx = WatchdogContext {
             binary: binary_str.to_string(),
             classify_script: classify_script_str.to_string(),
@@ -581,7 +635,7 @@ fn main() {
             python: venv_python_str.to_string(),
         };
 
-        let deploy_info = DeployInfo {
+        let info = DeployInfo {
             binary: binary_str.to_string(),
             results_dir: results_dir_str.to_string(),
             log_dir: log_dir_str,
@@ -594,6 +648,7 @@ fn main() {
             lc_nodes: lc_nodes.to_vec(),
         };
 
+        // Populate shared state so the TUI can see deploy results.
         let initial_cc_statuses: Vec<CcNodeStatus> = cc_started
             .iter()
             .map(|addr| CcNodeStatus {
@@ -603,26 +658,14 @@ fn main() {
             })
             .collect();
 
-        let dashboard_state = Arc::new(Mutex::new(DashboardState {
-            lc_crashes: 0,
-            lc_restarts: 0,
-            cc_crashes: 0,
-            cc_restarts: 0,
-            lc_replacements: 0,
-            throughput_history: Vec::new(),
-            per_node_history: HashMap::new(),
-            last_status: None,
-            start_time: std::time::Instant::now(),
-            completed_at: None,
-            cc_statuses: initial_cc_statuses,
-            telemetry_file: format!("{}/telemetry.json", results_dir_str),
-            telemetry_saved: false,
-        }));
+        {
+            let mut d = dashboard_state.lock().unwrap();
+            d.cc_statuses = initial_cc_statuses;
+            d.telemetry_file = format!("{}/telemetry.json", results_dir_str);
+        }
+        *deploy_info.lock().unwrap() = Some(info);
 
-        // Run three independent background threads; TUI runs on main thread.
-        //  1. Telemetry poller — polls CC /status every 3s (lightweight curl)
-        //  2. CC monitor — checks CC processes every 10s (SSH per node)
-        //  3. LC monitor — checks LC processes every 10s (SSH per node)
+        // Spawn watchdog threads (they run until the process exits).
         {
             let state = Arc::clone(&dashboard_state);
             let log = log_buf.clone();
@@ -646,10 +689,21 @@ fn main() {
                 lc_monitor(lc_watchlist, ctx, state, log);
             });
         }
-
-        if let Err(e) = dashboard::run_tui(dashboard_state, deploy_info, log_buf) {
-            eprintln!("TUI error: {}", e);
-        }
+    } else {
+        // CC-only deployment — still populate deploy_info for the TUI header.
+        let info = DeployInfo {
+            binary: binary_str.to_string(),
+            results_dir: results_dir_str.to_string(),
+            log_dir: log_dir_str,
+            cc_addrs: cc_started.clone(),
+            num_nodes: nodes.len(),
+            num_cc,
+            num_lc: 0,
+            nodes_file: nodes_file.display().to_string(),
+            cc_nodes: cc_nodes.to_vec(),
+            lc_nodes: vec![],
+        };
+        *deploy_info.lock().unwrap() = Some(info);
     }
 }
 
@@ -772,7 +826,8 @@ struct DashboardState {
     /// Per-node image history: node_id -> Vec<(unix_timestamp, images_total)>.
     per_node_history: HashMap<String, Vec<(u64, u64)>>,
     last_status: Option<StatusResponse>,
-    start_time: std::time::Instant,
+    /// Set when the user presses 's' (start). `None` means timer not started yet.
+    start_time: Option<std::time::Instant>,
     /// Frozen when all tasks are completed so the timer stops ticking.
     completed_at: Option<std::time::Instant>,
     /// Per-CC liveness and leader status (updated by telemetry_poller).
@@ -790,7 +845,7 @@ fn save_telemetry(state: &DashboardState, path: &str) {
     let elapsed = state
         .completed_at
         .unwrap_or_else(std::time::Instant::now)
-        .duration_since(state.start_time)
+        .duration_since(state.start_time.unwrap_or_else(std::time::Instant::now))
         .as_secs_f64();
 
     let data = serde_json::json!({

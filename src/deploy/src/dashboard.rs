@@ -472,9 +472,10 @@ impl LogBuffer {
 /// A macro-friendly logging function that appends to the buffer and also prints
 /// Run the interactive TUI dashboard. Blocks until the user presses 'q' or Ctrl+C.
 /// `state` and `log_buf` are polled each tick for updates.
+/// `deploy_info` starts as `None` while deploy is in progress and becomes `Some` once ready.
 pub fn run_tui(
     state: Arc<Mutex<DashboardState>>,
-    deploy_info: DeployInfo,
+    deploy_info: Arc<Mutex<Option<DeployInfo>>>,
     log_buf: LogBuffer,
 ) -> io::Result<()> {
     enable_raw_mode()?;
@@ -493,7 +494,7 @@ pub fn run_tui(
 fn tui_loop(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
     state: Arc<Mutex<DashboardState>>,
-    deploy_info: &DeployInfo,
+    deploy_info: &Arc<Mutex<Option<DeployInfo>>>,
     log_buf: &LogBuffer,
 ) -> io::Result<()> {
     let mut tui = TuiState {
@@ -502,13 +503,19 @@ fn tui_loop(
         label_counts: None,
         cluster_started: false,
     };
-    let total_nodes = deploy_info.cc_nodes.len() + deploy_info.lc_nodes.len();
 
     loop {
+        // Lock deploy_info once per frame.
+        let info_guard = deploy_info.lock().unwrap();
+        let total_nodes = info_guard
+            .as_ref()
+            .map_or(0, |di| di.cc_nodes.len() + di.lc_nodes.len());
+
         terminal.draw(|f| {
             let state = state.lock().unwrap();
-            draw_ui(f, &state, deploy_info, log_buf, &tui);
+            draw_ui(f, &state, info_guard.as_ref(), log_buf, &tui);
         })?;
+        drop(info_guard);
 
         // Poll for events with a 200ms timeout so the UI refreshes ~5x/sec.
         if event::poll(Duration::from_millis(200))? {
@@ -538,19 +545,26 @@ fn tui_loop(
                             }
                         }
                         KeyCode::Char('k') | KeyCode::Char('K') => {
-                            if total_nodes > 0 {
-                                let hostname = node_hostname(deploy_info, tui.selected_node);
-                                kill_node(&hostname, log_buf);
+                            let info_guard = deploy_info.lock().unwrap();
+                            if let Some(di) = info_guard.as_ref() {
+                                if total_nodes > 0 {
+                                    let hostname = node_hostname(di, tui.selected_node);
+                                    drop(info_guard);
+                                    kill_node(&hostname, log_buf);
+                                }
                             }
                         }
                         KeyCode::Char('a') | KeyCode::Char('A') => {
-                            // Kill one agent on the selected LC node.
-                            if total_nodes > 0
-                                && tui.selected_node >= deploy_info.cc_nodes.len()
-                            {
-                                let hostname =
-                                    node_hostname(deploy_info, tui.selected_node);
-                                kill_one_agent(&hostname, log_buf);
+                            let info_guard = deploy_info.lock().unwrap();
+                            if let Some(di) = info_guard.as_ref() {
+                                if total_nodes > 0
+                                    && tui.selected_node >= di.cc_nodes.len()
+                                {
+                                    let hostname =
+                                        node_hostname(di, tui.selected_node);
+                                    drop(info_guard);
+                                    kill_one_agent(&hostname, log_buf);
+                                }
                             }
                         }
                         KeyCode::Char('r') | KeyCode::Char('R') => {
@@ -558,14 +572,22 @@ fn tui_loop(
                                 // Toggle off.
                                 tui.show_results = false;
                             } else {
-                                tui.show_results = true;
-                                tui.label_counts = Some(load_results(&deploy_info.results_dir));
+                                let info_guard = deploy_info.lock().unwrap();
+                                if let Some(di) = info_guard.as_ref() {
+                                    tui.show_results = true;
+                                    tui.label_counts = Some(load_results(&di.results_dir));
+                                }
                             }
                         }
                         KeyCode::Char('s') | KeyCode::Char('S') => {
                             if !tui.cluster_started {
-                                send_start_signal(&deploy_info.cc_addrs, log_buf);
-                                tui.cluster_started = true;
+                                let info_guard = deploy_info.lock().unwrap();
+                                if let Some(di) = info_guard.as_ref() {
+                                    send_start_signal(&di.cc_addrs, log_buf);
+                                    tui.cluster_started = true;
+                                    // Start the timer now.
+                                    state.lock().unwrap().start_time = Some(std::time::Instant::now());
+                                }
                             }
                         }
                         KeyCode::Esc => {
@@ -582,7 +604,7 @@ fn tui_loop(
 fn draw_ui(
     f: &mut Frame,
     state: &DashboardState,
-    deploy_info: &DeployInfo,
+    deploy_info: Option<&DeployInfo>,
     log_buf: &LogBuffer,
     tui: &TuiState,
 ) {
@@ -607,26 +629,31 @@ fn draw_ui(
     draw_footer(f, main_chunks[4], tui);
 }
 
-fn draw_header(f: &mut Frame, area: Rect, info: &DeployInfo, state: &DashboardState) {
-    // If completed, show frozen completion time; otherwise show live elapsed.
-    let elapsed = if let Some(completed_at) = state.completed_at {
-        completed_at.duration_since(state.start_time).as_secs()
-    } else {
-        state.start_time.elapsed().as_secs()
-    };
-
-    let timer_spans = if state.completed_at.is_some() {
+fn draw_header(f: &mut Frame, area: Rect, info: Option<&DeployInfo>, state: &DashboardState) {
+    // If completed, show frozen completion time; if started, show live elapsed; else show waiting.
+    let timer_spans = if let Some(completed_at) = state.completed_at {
+        let elapsed = state.start_time
+            .map(|st| completed_at.duration_since(st).as_secs())
+            .unwrap_or(0);
         vec![
             Span::styled(
                 format!("✅ Completed in {}", fmt_duration(elapsed)),
                 Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
             ),
         ]
-    } else {
+    } else if let Some(start) = state.start_time {
+        let elapsed = start.elapsed().as_secs();
         vec![
             Span::styled(
                 format!("⏱ {}", fmt_duration(elapsed)),
                 Style::default().fg(Color::Yellow),
+            ),
+        ]
+    } else {
+        vec![
+            Span::styled(
+                "⏱ waiting for start".to_string(),
+                Style::default().fg(Color::DarkGray),
             ),
         ]
     };
@@ -642,31 +669,49 @@ fn draw_header(f: &mut Frame, area: Rect, info: &DeployInfo, state: &DashboardSt
     ];
     title_spans.extend(timer_spans);
 
+    let (cc_addrs_str, nodes_str, results_str, log_str, binary_str, nodes_file_str) =
+        if let Some(info) = info {
+            (
+                info.cc_addrs.join("  "),
+                format!("{} total  ({} CC, {} LC)", info.num_nodes, info.num_cc, info.num_lc),
+                info.results_dir.as_str(),
+                info.log_dir.as_str(),
+                info.binary.as_str(),
+                info.nodes_file.as_str(),
+            )
+        } else {
+            (
+                "deploying…".into(),
+                "deploying…".into(),
+                "—",
+                "—",
+                "—",
+                "—",
+            )
+        };
+
     let lines = vec![
         Line::from(title_spans),
         Line::from(vec![
             Span::styled(" CCs: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(info.cc_addrs.join("  ")),
+            Span::raw(cc_addrs_str),
         ]),
         Line::from(vec![
             Span::styled(" Nodes: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(format!(
-                "{} total  ({} CC, {} LC)",
-                info.num_nodes, info.num_cc, info.num_lc
-            )),
+            Span::raw(nodes_str),
             Span::raw("   "),
             Span::styled("Results: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(&info.results_dir),
+            Span::raw(results_str),
             Span::raw("   "),
             Span::styled("Logs: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(&info.log_dir),
+            Span::raw(log_str),
         ]),
         Line::from(vec![
             Span::styled(" Binary: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(&info.binary),
+            Span::raw(binary_str),
             Span::raw("   "),
             Span::styled("Nodes file: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(&info.nodes_file),
+            Span::raw(nodes_file_str),
         ]),
     ];
 
@@ -828,7 +873,7 @@ fn draw_progress(f: &mut Frame, area: Rect, state: &DashboardState) {
     }
 }
 
-fn draw_middle(f: &mut Frame, area: Rect, state: &DashboardState, deploy_info: &DeployInfo, tui: &TuiState) {
+fn draw_middle(f: &mut Frame, area: Rect, state: &DashboardState, deploy_info: Option<&DeployInfo>, tui: &TuiState) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
@@ -846,7 +891,7 @@ fn draw_nodes(
     f: &mut Frame,
     area: Rect,
     state: &DashboardState,
-    deploy_info: &DeployInfo,
+    deploy_info: Option<&DeployInfo>,
     selected: usize,
 ) {
     let block = Block::default()
@@ -857,6 +902,12 @@ fn draw_nodes(
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    let Some(deploy_info) = deploy_info else {
+        let msg = Paragraph::new(" Deploying…")
+            .style(Style::default().fg(Color::DarkGray));
+        f.render_widget(msg, inner);
+        return;
+    };
     let cc_count = deploy_info.cc_nodes.len();
     let mut rows: Vec<Row> = Vec::new();
 
