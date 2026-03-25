@@ -7,7 +7,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -47,6 +47,9 @@ struct StateMachine {
     tasks: HashMap<u64, TaskBatch>,
     nodes: HashMap<String, NodeInfo>,
     next_batch_id: u64,
+    /// O(1) queue of batch IDs that are ready to be assigned.
+    /// Stale entries (already assigned/completed) are lazily skipped.
+    pending_queue: VecDeque<u64>,
 }
 
 impl StateMachine {
@@ -55,6 +58,7 @@ impl StateMachine {
             tasks: HashMap::new(),
             nodes: HashMap::new(),
             next_batch_id: 0,
+            pending_queue: VecDeque::new(),
         }
     }
 
@@ -67,12 +71,18 @@ impl StateMachine {
                 batch_id,
                 image_paths,
             } => {
-                self.tasks.entry(batch_id).or_insert_with(|| TaskBatch {
-                    batch_id,
-                    image_paths,
-                    status: TaskStatus::Pending,
-                    labels: HashMap::new(),
-                });
+                if !self.tasks.contains_key(&batch_id) {
+                    self.tasks.insert(
+                        batch_id,
+                        TaskBatch {
+                            batch_id,
+                            image_paths,
+                            status: TaskStatus::Pending,
+                            labels: HashMap::new(),
+                        },
+                    );
+                    self.pending_queue.push_back(batch_id);
+                }
                 if batch_id >= self.next_batch_id {
                     self.next_batch_id = batch_id + 1;
                 }
@@ -108,6 +118,7 @@ impl StateMachine {
                 if let Some(batch) = self.tasks.get_mut(&batch_id) {
                     if matches!(batch.status, TaskStatus::Assigned { .. }) {
                         batch.status = TaskStatus::Pending;
+                        self.pending_queue.push_back(batch_id);
                     }
                 }
             }
@@ -134,11 +145,18 @@ impl StateMachine {
         }
     }
 
-    /// Return the first batch with status `Pending`, if any.
-    fn next_pending_batch(&self) -> Option<&TaskBatch> {
-        self.tasks
-            .values()
-            .find(|b| b.status == TaskStatus::Pending)
+    /// Pop and return the next pending batch, lazily skipping stale entries.
+    /// O(1) amortised instead of O(n) linear scan.
+    fn next_pending_batch(&mut self) -> Option<TaskBatch> {
+        while let Some(&batch_id) = self.pending_queue.front() {
+            if let Some(batch) = self.tasks.get(&batch_id) {
+                if batch.status == TaskStatus::Pending {
+                    return Some(batch.clone());
+                }
+            }
+            self.pending_queue.pop_front();
+        }
+        None
     }
 
     /// Collect the `batch_id`s of all batches whose assignment TTL has expired.
@@ -356,8 +374,8 @@ async fn handle_task_request(
     for _ in 0..5u32 {
         // Find a pending batch (brief lock, no I/O).
         let batch = {
-            let sm = app.sm.lock().expect("sm lock");
-            sm.next_pending_batch().cloned()
+            let mut sm = app.sm.lock().expect("sm lock");
+            sm.next_pending_batch()
         };
         let Some(batch) = batch else {
             return Err(ApiError::NoWorkAvailable);
@@ -551,6 +569,10 @@ async fn ttl_reaper_loop(app: AppState, ttl_secs: u64) {
 /// mid-ingestion crash picks up exactly where the previous leader left off.
 /// Returns `true` if all batches were successfully ingested, `false` if
 /// ingestion was partial and should be retried.
+///
+/// Uses gap detection (checks which batch IDs exist in the state machine)
+/// so it correctly fills holes left by a previous partial ingestion, and
+/// pipelines up to `MAX_IN_FLIGHT` Raft proposals for throughput.
 async fn ingest_image_tasks(app: &AppState, image_dir: &str, batch_size: usize) -> bool {
     tracing::info!(
         "Ingesting image tasks from {} (batch_size={})",
@@ -591,12 +613,23 @@ async fn ingest_image_tasks(app: &AppState, image_dir: &str, batch_size: usize) 
     }
 
     names.sort_unstable();
-    let total_batches = names.len().div_ceil(batch_size) as u64;
+    let total_batches = names.len().div_ceil(batch_size);
 
-    // How many batches have already been committed by a previous leader.
-    let mut next_id = app.sm.lock().expect("sm lock").next_batch_id;
+    // Find which batch IDs are missing from the state machine (handles gaps
+    // from partial previous ingestion as well as fresh start).
+    let existing_ids: HashSet<u64> = {
+        let sm = app.sm.lock().expect("sm lock");
+        sm.tasks.keys().copied().collect()
+    };
 
-    if next_id >= total_batches {
+    let missing: Vec<(u64, Vec<String>)> = names
+        .chunks(batch_size)
+        .enumerate()
+        .filter(|(i, _)| !existing_ids.contains(&(*i as u64)))
+        .map(|(i, chunk)| (i as u64, chunk.to_vec()))
+        .collect();
+
+    if missing.is_empty() {
         tracing::info!(
             "All {} batches already ingested — nothing to do",
             total_batches
@@ -605,29 +638,74 @@ async fn ingest_image_tasks(app: &AppState, image_dir: &str, batch_size: usize) 
     }
 
     tracing::info!(
-        "Found {} images ({} batches total), resuming from batch {}",
+        "Found {} images ({} batches total), {} to ingest",
         names.len(),
         total_batches,
-        next_id,
+        missing.len(),
     );
 
-    // Skip the image chunks already covered by committed batches.
-    for chunk in names.chunks(batch_size).skip(next_id as usize) {
-        if let Err(e) = app
-            .raft
-            .propose(Command::AddTaskBatch {
-                batch_id: next_id,
-                image_paths: chunk.to_vec(),
-            })
-            .await
-        {
-            tracing::error!("Failed to propose AddTaskBatch {}: {}", next_id, e);
-            return false;
+    // Pipeline proposals: keep up to MAX_IN_FLIGHT concurrent Raft commits.
+    const MAX_IN_FLIGHT: usize = 16;
+    let mut in_flight: VecDeque<(u64, tokio::task::JoinHandle<anyhow::Result<()>>)> =
+        VecDeque::new();
+    let mut failed = false;
+
+    for (batch_id, image_paths) in missing {
+        // Drain oldest if at capacity.
+        while in_flight.len() >= MAX_IN_FLIGHT {
+            let (id, handle) = in_flight.pop_front().unwrap();
+            match handle.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::error!("Failed to propose AddTaskBatch {}: {}", id, e);
+                    failed = true;
+                    break;
+                }
+                Err(e) => {
+                    tracing::error!("Ingestion task {} panicked: {}", id, e);
+                    failed = true;
+                    break;
+                }
+            }
         }
-        next_id += 1;
+        if failed {
+            break;
+        }
+
+        let raft = app.raft.clone();
+        in_flight.push_back((
+            batch_id,
+            tokio::spawn(async move {
+                raft.propose(Command::AddTaskBatch {
+                    batch_id,
+                    image_paths,
+                })
+                .await
+            }),
+        ));
     }
 
-    tracing::info!("Ingestion complete: {} batches proposed", next_id);
+    // Drain remaining in-flight proposals.
+    for (id, handle) in in_flight {
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::error!("Failed to propose AddTaskBatch {}: {}", id, e);
+                failed = true;
+            }
+            Err(e) => {
+                tracing::error!("Ingestion task {} panicked: {}", id, e);
+                failed = true;
+            }
+        }
+    }
+
+    if failed {
+        tracing::warn!("Ingestion incomplete — will retry");
+        return false;
+    }
+
+    tracing::info!("Ingestion complete: {} batches", total_batches);
     true
 }
 

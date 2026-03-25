@@ -1,6 +1,8 @@
 use crate::common::*;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 
 pub struct AgentConfig {
     pub agent_id: String,
@@ -232,60 +234,83 @@ async fn send_heartbeat(
 
 // region feature extraction
 
-/// Process all images in a batch by running the feature extractor on each.
-/// Returns a list of (image_path, label) pairs.
+/// Process all images in a batch by running the feature extractor once for the
+/// entire batch.  The script reads image paths from stdin and outputs
+/// `path\tlabel` lines on stdout.  Model loading happens once per batch
+/// instead of once per image.
 async fn process_batch(
     config: &AgentConfig,
     assignment: &TaskAssignment,
 ) -> anyhow::Result<Vec<(String, String)>> {
-    let mut results = Vec::with_capacity(assignment.image_paths.len());
-
+    // Build full paths and a reverse map back to the original relative names.
+    let mut full_to_rel: HashMap<String, String> = HashMap::with_capacity(assignment.image_paths.len());
+    let mut stdin_buf = String::new();
     for image_path in &assignment.image_paths {
         let full_path = format!("{}/{}", config.image_base_path, image_path);
-        let label = run_feature_extractor(&config.python, &config.extractor_script, &full_path).await?;
-        results.push((image_path.clone(), label));
+        full_to_rel.insert(full_path.clone(), image_path.clone());
+        stdin_buf.push_str(&full_path);
+        stdin_buf.push('\n');
     }
 
-    Ok(results)
-}
+    let mut child = tokio::process::Command::new(&config.python)
+        .arg(&config.extractor_script)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("Failed to spawn {}: {}", config.python, e))?;
 
-/// Run the provided Python feature extraction script on a single image.
-/// Returns the predicted label (the trimmed first line of stdout).
-async fn run_feature_extractor(python: &str, script_path: &str, image_path: &str) -> anyhow::Result<String> {
-    let output = tokio::process::Command::new(python)
-        .arg(script_path)
-        .arg(image_path)
-        .output()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to spawn {}: {}", python, e))?;
+    // Write all paths to stdin, then close it to signal EOF.
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(stdin_buf.as_bytes()).await?;
+        // stdin dropped here → EOF
+    }
+
+    let output = child.wait_with_output().await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!(
-            "Feature extractor exited with {}: {}",
+            "Batch classifier exited with {}: {}",
             output.status,
-            stderr.trim()
+            stderr.chars().take(500).collect::<String>()
         );
     }
 
-    let label = String::from_utf8(output.stdout)
-        .map_err(|e| anyhow::anyhow!("Non-UTF8 output from feature extractor: {}", e))?;
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|e| anyhow::anyhow!("Non-UTF8 output from batch classifier: {}", e))?;
 
-    // Take the last non-empty line as the label.
-    // classify.py prints "Reading image ..." first, then the actual label.
-    let label = label
-        .lines()
-        .rev()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("")
-        .trim()
-        .to_string();
-
-    if label.is_empty() {
-        anyhow::bail!("Feature extractor produced no output for {}", image_path);
+    // Parse "full_path\tlabel" lines.
+    let mut results = Vec::with_capacity(assignment.image_paths.len());
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((full_path, label)) = line.split_once('\t') {
+            if let Some(rel_path) = full_to_rel.get(full_path) {
+                results.push((rel_path.clone(), label.to_string()));
+            } else {
+                tracing::warn!("Batch classifier returned unknown path: {}", full_path);
+            }
+        }
     }
 
-    Ok(label)
+    if results.is_empty() {
+        anyhow::bail!("Batch classifier produced no results for {} images", assignment.image_paths.len());
+    }
+
+    let stderr_str = String::from_utf8_lossy(&output.stderr);
+    if !stderr_str.trim().is_empty() {
+        tracing::warn!(
+            "Batch classifier stderr ({} images, {} results): {}",
+            assignment.image_paths.len(),
+            results.len(),
+            stderr_str.chars().take(300).collect::<String>()
+        );
+    }
+
+    Ok(results)
 }
 
 // endregion
