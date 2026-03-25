@@ -63,6 +63,8 @@ struct StateMachine {
     per_agent_completions: HashMap<String, u64>,
     /// agent_id -> images completed
     per_agent_images: HashMap<String, u64>,
+    /// agent_id -> TTL expirations (how many times an assignment to this agent expired)
+    per_agent_ttl_expirations: HashMap<String, u64>,
     /// Configured batch size (for telemetry reporting).
     batch_size: usize,
     /// Max images configured (for telemetry reporting).
@@ -84,6 +86,7 @@ impl StateMachine {
             started_at: None,
             per_agent_completions: HashMap::new(),
             per_agent_images: HashMap::new(),
+            per_agent_ttl_expirations: HashMap::new(),
             batch_size,
             max_images,
         }
@@ -163,7 +166,11 @@ impl StateMachine {
 
             Command::ExpireTask { batch_id } => {
                 if let Some(batch) = self.tasks.get_mut(&batch_id) {
-                    if matches!(batch.status, TaskStatus::Assigned { .. }) {
+                    if let TaskStatus::Assigned { ref agent_id, .. } = batch.status {
+                        *self
+                            .per_agent_ttl_expirations
+                            .entry(agent_id.clone())
+                            .or_insert(0) += 1;
                         batch.status = TaskStatus::Pending;
                         self.pending_queue.push_back(batch_id);
                         self.ttl_expirations += 1;
@@ -257,6 +264,7 @@ impl StateMachine {
         // Agent IDs follow the pattern: "<node_id>-agent-<N>"
         let mut per_node_completions: HashMap<String, u64> = HashMap::new();
         let mut per_node_images: HashMap<String, u64> = HashMap::new();
+        let mut per_node_ttl_expirations: HashMap<String, u64> = HashMap::new();
         for (agent_id, count) in &self.per_agent_completions {
             let node_id = agent_id_to_node(agent_id);
             *per_node_completions.entry(node_id).or_insert(0) += count;
@@ -265,11 +273,17 @@ impl StateMachine {
             let node_id = agent_id_to_node(agent_id);
             *per_node_images.entry(node_id).or_insert(0) += count;
         }
+        for (agent_id, count) in &self.per_agent_ttl_expirations {
+            let node_id = agent_id_to_node(agent_id);
+            *per_node_ttl_expirations.entry(node_id).or_insert(0) += count;
+        }
 
         let mut pnc: Vec<(String, u64)> = per_node_completions.into_iter().collect();
         pnc.sort_by(|a, b| b.1.cmp(&a.1));
         let mut pni: Vec<(String, u64)> = per_node_images.into_iter().collect();
         pni.sort_by(|a, b| b.1.cmp(&a.1));
+        let mut pnt: Vec<(String, u64)> = per_node_ttl_expirations.into_iter().collect();
+        pnt.sort_by(|a, b| b.1.cmp(&a.1));
 
         let telemetry = ClusterTelemetry {
             total_images,
@@ -282,6 +296,7 @@ impl StateMachine {
             started_at: self.started_at,
             per_node_completions: pnc,
             per_node_images: pni,
+            per_node_ttl_expirations: pnt,
             batch_size: self.batch_size,
             max_images: self.max_images,
         };

@@ -159,11 +159,27 @@ fn tui_loop(
                                 kill_node(&hostname, log_buf);
                             }
                         }
+                        KeyCode::Char('a') | KeyCode::Char('A') => {
+                            // Kill one agent on the selected LC node.
+                            if total_nodes > 0
+                                && tui.selected_node >= deploy_info.cc_nodes.len()
+                            {
+                                let hostname =
+                                    node_hostname(deploy_info, tui.selected_node);
+                                kill_one_agent(&hostname, log_buf);
+                            }
+                        }
                         KeyCode::Char('r') | KeyCode::Char('R') => {
-                            tui.show_results = !tui.show_results;
-                            if tui.show_results && tui.label_counts.is_none() {
+                            if tui.show_results {
+                                // Already showing — refresh the data.
+                                tui.label_counts = Some(load_results(&deploy_info.results_dir));
+                            } else {
+                                tui.show_results = true;
                                 tui.label_counts = Some(load_results(&deploy_info.results_dir));
                             }
+                        }
+                        KeyCode::Esc => {
+                            tui.show_results = false;
                         }
                         _ => {}
                     }
@@ -455,6 +471,18 @@ fn draw_nodes(
     let mut rows: Vec<Row> = Vec::new();
 
     for (i, hostname) in deploy_info.cc_nodes.iter().enumerate() {
+        let cc_status = state
+            .cc_statuses
+            .get(i)
+            .filter(|s| s.addr.starts_with(hostname));
+
+        let (status_str, status_color) = match cc_status {
+            Some(s) if s.is_leader => ("★ leader".to_string(), Color::Green),
+            Some(s) if s.alive => ("follower".to_string(), Color::Cyan),
+            Some(_) => ("✗ dead".to_string(), Color::Red),
+            None => ("—".to_string(), Color::DarkGray),
+        };
+
         let style = if i == selected {
             Style::default()
                 .bg(Color::DarkGray)
@@ -467,7 +495,7 @@ fn draw_nodes(
             Row::new(vec![
                 Cell::from(format!("CC{}", i + 1)).style(Style::default().fg(Color::Cyan)),
                 Cell::from(hostname.as_str()),
-                Cell::from("—"),
+                Cell::from(status_str).style(Style::default().fg(status_color)),
             ])
             .style(style),
         );
@@ -566,7 +594,9 @@ fn draw_per_node(f: &mut Frame, area: Rect, state: &DashboardState) {
         let header = Row::new(vec![
             Cell::from("Node").style(Style::default().add_modifier(Modifier::BOLD)),
             Cell::from("Images").style(Style::default().add_modifier(Modifier::BOLD)),
+            Cell::from("img/s").style(Style::default().add_modifier(Modifier::BOLD)),
             Cell::from("Batches").style(Style::default().add_modifier(Modifier::BOLD)),
+            Cell::from("TTLs").style(Style::default().add_modifier(Modifier::BOLD)),
             Cell::from("Bar").style(Style::default().add_modifier(Modifier::BOLD)),
         ]);
 
@@ -580,6 +610,16 @@ fn draw_per_node(f: &mut Frame, area: Rect, state: &DashboardState) {
                     .find(|(n, _)| n == node_id)
                     .map(|(_, c)| *c)
                     .unwrap_or(0);
+
+                let ttl_count = t
+                    .per_node_ttl_expirations
+                    .iter()
+                    .find(|(n, _)| n == node_id)
+                    .map(|(_, c)| *c)
+                    .unwrap_or(0);
+
+                // Calculate per-node img/s from history (last 60s window).
+                let rate = calc_per_node_rate(state, node_id);
 
                 let bar_width: usize = 15;
                 let filled = if max_img > 0 {
@@ -599,10 +639,18 @@ fn draw_per_node(f: &mut Frame, area: Rect, state: &DashboardState) {
                     node_id
                 };
 
+                let ttl_cell = if ttl_count > 0 {
+                    Cell::from(format!("{}", ttl_count)).style(Style::default().fg(Color::Red))
+                } else {
+                    Cell::from("0")
+                };
+
                 Row::new(vec![
                     Cell::from(display_id.to_string()),
                     Cell::from(fmt_num(*img_count)),
+                    Cell::from(format!("{:.1}", rate)),
                     Cell::from(fmt_num(batch_count)),
+                    ttl_cell,
                     Cell::from(bar),
                 ])
             })
@@ -611,7 +659,9 @@ fn draw_per_node(f: &mut Frame, area: Rect, state: &DashboardState) {
         let widths = [
             Constraint::Length(17),
             Constraint::Length(10),
+            Constraint::Length(7),
             Constraint::Length(8),
+            Constraint::Length(5),
             Constraint::Min(10),
         ];
 
@@ -744,12 +794,7 @@ fn draw_logs(f: &mut Frame, area: Rect, log_buf: &LogBuffer) {
 }
 
 fn draw_footer(f: &mut Frame, area: Rect, tui: &TuiState) {
-    let results_label = if tui.show_results {
-        "r throughput"
-    } else {
-        "r results"
-    };
-    let footer = Paragraph::new(Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             " q",
             Style::default()
@@ -772,13 +817,32 @@ fn draw_footer(f: &mut Frame, area: Rect, tui: &TuiState) {
         ),
         Span::raw(" kill node  "),
         Span::styled(
+            "a",
+            Style::default()
+                .fg(Color::Red)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" kill agent  "),
+        Span::styled(
             "r",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(format!(" {}", results_label)),
-    ]));
+    ];
+    if tui.show_results {
+        spans.push(Span::raw(" refresh  "));
+        spans.push(Span::styled(
+            "Esc",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(" back"));
+    } else {
+        spans.push(Span::raw(" results"));
+    }
+    let footer = Paragraph::new(Line::from(spans));
     f.render_widget(footer, area);
 }
 
@@ -855,6 +919,29 @@ fn calc_throughput_batches(state: &DashboardState) -> (f64, f64) {
     (avg, recent)
 }
 
+/// Calculate per-node img/s rate from the last 60s of per_node_history.
+fn calc_per_node_rate(state: &DashboardState, node_id: &str) -> f64 {
+    let Some(history) = state.per_node_history.get(node_id) else {
+        return 0.0;
+    };
+    if history.len() < 2 {
+        return 0.0;
+    }
+    let now_entry = history.last().unwrap();
+    let cutoff = now_entry.0.saturating_sub(60);
+    let old_entry = history
+        .iter()
+        .rev()
+        .find(|(ts, _)| *ts <= cutoff)
+        .unwrap_or(history.first().unwrap());
+    let dt = now_entry.0.saturating_sub(old_entry.0);
+    if dt > 0 {
+        (now_entry.1 - old_entry.1) as f64 / dt as f64
+    } else {
+        0.0
+    }
+}
+
 /// Get the hostname of the node at the given index in the combined CC+LC list.
 fn node_hostname(info: &DeployInfo, index: usize) -> String {
     if index < info.cc_nodes.len() {
@@ -902,8 +989,49 @@ fn kill_node(hostname: &str, log_buf: &LogBuffer) {
     });
 }
 
-/// Read results NDJSON files and count images per label.
+/// Kill one agent process on the given LC hostname (oldest agent first).
+fn kill_one_agent(hostname: &str, log_buf: &LogBuffer) {
+    let hostname = hostname.to_string();
+    let log_buf = log_buf.clone();
+    std::thread::spawn(move || {
+        log_buf.push(format!("⚡ Killing one agent on {}…", hostname));
+        // Find the oldest agent process (by PID, lowest = oldest) and kill it.
+        // Agents run as: inf3203_aika agent --agent-id ...
+        let result = std::process::Command::new("ssh")
+            .args([
+                "-n",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=5",
+                "-o",
+                "StrictHostKeyChecking=no",
+                &hostname,
+            ])
+            .arg("pgrep -f 'inf3203_aika agent' | head -1 | xargs -r kill")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        match result {
+            Ok(s) if s.success() => {
+                log_buf.push(format!("⚡ Killed one agent on {}", hostname));
+            }
+            Ok(_) => {
+                log_buf.push(format!(
+                    "⚡ No agent processes on {} (already dead?)",
+                    hostname
+                ));
+            }
+            Err(e) => {
+                log_buf.push(format!("⚡ SSH to {} failed: {}", hostname, e));
+            }
+        }
+    });
+}
+
+/// Read results NDJSON files, deduplicate by batch_id, and count images per label.
 fn load_results(results_dir: &str) -> Vec<(String, u64)> {
+    let mut seen_batches: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut label_counts: HashMap<String, u64> = HashMap::new();
 
     let entries = match std::fs::read_dir(results_dir) {
@@ -924,6 +1052,12 @@ fn load_results(results_dir: &str) -> Vec<(String, u64)> {
                     continue;
                 }
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                    // Deduplicate by batch_id — a batch can appear in multiple
+                    // result files when leadership changed mid-run.
+                    let batch_id = v["batch_id"].as_u64().unwrap_or(0);
+                    if !seen_batches.insert(batch_id) {
+                        continue; // already counted this batch
+                    }
                     if let Some(labels) = v["labels"].as_array() {
                         for pair in labels {
                             if let Some(label) = pair.get(1).and_then(|l| l.as_str()) {

@@ -13,6 +13,7 @@ mod dashboard;
 
 use rand::Rng;
 use rand::seq::SliceRandom;
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::Write as _;
@@ -140,12 +141,18 @@ fn ssh_run(node: &str, cmd: &str) -> bool {
 
 /// SSH to `node` and start an Aika node as a detached background process.
 /// stdout and stderr are appended to `log_file` (must be an NFS path visible from the remote node).
+/// Waits 2s then verifies the process is actually running.
 fn ssh_start(node: &str, binary: &str, args: &str, log_file: &str) -> bool {
     let cmd = format!(
         "nohup {} {} </dev/null >>{} 2>&1 &",
         binary, args, log_file
     );
-    ssh_run(node, &cmd)
+    if !ssh_run(node, &cmd) {
+        return false;
+    }
+    // Give the process a moment to start (or crash immediately).
+    thread::sleep(Duration::from_secs(2));
+    ssh_run(node, "pgrep -f inf3203_aika > /dev/null 2>&1")
 }
 
 /// Ensure a Python virtual environment with the required packages exists in
@@ -508,18 +515,19 @@ fn main() {
                 node_id, port, peer_list, agents, classify_script_str, IMAGE_DIR, venv_python_str
             );
             // Watchdog always restarts as a standby replica (--agents 0)
-            // to replace the old replica that CC promoted
-            let restart_args = format!(
-                "local-controller --node-id {} --bind 0.0.0.0:{} --cc-addrs {} \
+            // to replace the old replica that CC promoted.
+            // Uses {PORT} placeholder — resolved at restart time to a fresh port.
+            let restart_args_template = format!(
+                "local-controller --node-id {} --bind 0.0.0.0:{{PORT}} --cc-addrs {} \
                  --agents 0 --extractor-script {} --image-base-path {} --python {}",
-                node_id, port, peer_list, classify_script_str, IMAGE_DIR, venv_python_str
+                node_id, peer_list, classify_script_str, IMAGE_DIR, venv_python_str
             );
 
             let log_file = format!("{}/lc-{}.log", log_dir_str, node);
             if ssh_start(node, binary_str, &lc_args, &log_file) {
                 log_msg!(log_buf, "  LC [{}] {} @ {}:{} … ok", label, node_id, node, port);
                 lc_started += 1;
-                lc_watchlist.push((node.clone(), binary_str.to_string(), restart_args));
+                lc_watchlist.push((node.clone(), node_id, restart_args_template));
             } else {
                 log_msg!(log_buf, "  LC [{}] {} @ {}:{} … FAILED", label, node_id, node, port);
             }
@@ -580,6 +588,15 @@ fn main() {
             lc_nodes: lc_nodes.to_vec(),
         };
 
+        let initial_cc_statuses: Vec<CcNodeStatus> = cc_started
+            .iter()
+            .map(|addr| CcNodeStatus {
+                addr: addr.clone(),
+                alive: true,
+                is_leader: false,
+            })
+            .collect();
+
         let dashboard_state = Arc::new(Mutex::new(DashboardState {
             lc_crashes: 0,
             lc_restarts: 0,
@@ -587,9 +604,13 @@ fn main() {
             cc_restarts: 0,
             lc_replacements: 0,
             throughput_history: Vec::new(),
+            per_node_history: HashMap::new(),
             last_status: None,
             start_time: std::time::Instant::now(),
             completed_at: None,
+            cc_statuses: initial_cc_statuses,
+            telemetry_file: format!("{}/telemetry.json", results_dir_str),
+            telemetry_saved: false,
         }));
 
         // Run three independent background threads; TUI runs on main thread.
@@ -658,8 +679,10 @@ struct WatchdogContext {
 /// One entry in the watchdog's tracking list.
 struct WatchdogEntry {
     node: String,
+    node_id: String,
     /// Always `--agents 0` — restarts rejoin as standby replica.
-    restart_args: String,
+    /// Contains a `{PORT}` placeholder that gets replaced with a fresh port.
+    restart_args_template: String,
     /// How many consecutive restart attempts have failed for this entry.
     failed_attempts: u32,
     /// When we first detected this node as down in the current failure episode.
@@ -696,8 +719,17 @@ struct TelemetryResp {
     started_at: Option<u64>,
     per_node_completions: Vec<(String, u64)>,
     per_node_images: Vec<(String, u64)>,
+    per_node_ttl_expirations: Vec<(String, u64)>,
     batch_size: usize,
     max_images: u64,
+}
+
+/// Per-CC status tracked by the telemetry poller.
+#[derive(Clone)]
+struct CcNodeStatus {
+    addr: String,
+    alive: bool,
+    is_leader: bool,
 }
 
 /// Dashboard state accumulated across polling cycles.
@@ -709,10 +741,67 @@ struct DashboardState {
     lc_replacements: u32,
     /// History of (unix_timestamp, completed_batches) for throughput calculation.
     throughput_history: Vec<(u64, u64)>,
+    /// Per-node image history: node_id -> Vec<(unix_timestamp, images_total)>.
+    per_node_history: HashMap<String, Vec<(u64, u64)>>,
     last_status: Option<StatusResponse>,
     start_time: std::time::Instant,
     /// Frozen when all tasks are completed so the timer stops ticking.
     completed_at: Option<std::time::Instant>,
+    /// Per-CC liveness and leader status (updated by telemetry_poller).
+    cc_statuses: Vec<CcNodeStatus>,
+    /// Path to write telemetry JSON on completion.
+    telemetry_file: String,
+    /// Whether we already persisted telemetry.
+    telemetry_saved: bool,
+}
+
+/// Persist telemetry snapshot to JSON for later analysis/figures.
+fn save_telemetry(state: &DashboardState, path: &str) {
+    use std::io::Write;
+
+    let elapsed = state
+        .completed_at
+        .unwrap_or_else(std::time::Instant::now)
+        .duration_since(state.start_time)
+        .as_secs_f64();
+
+    let data = serde_json::json!({
+        "elapsed_secs": elapsed,
+        "throughput_history": state.throughput_history.iter()
+            .map(|(t, c)| serde_json::json!({"ts": t, "completed": c}))
+            .collect::<Vec<_>>(),
+        "per_node_history": state.per_node_history.iter()
+            .map(|(node, hist)| (node.clone(), hist.iter()
+                .map(|(t, c)| serde_json::json!({"ts": t, "images": c}))
+                .collect::<Vec<_>>()))
+            .collect::<HashMap<_, _>>(),
+        "fault_tolerance": {
+            "lc_crashes": state.lc_crashes,
+            "lc_restarts": state.lc_restarts,
+            "cc_crashes": state.cc_crashes,
+            "cc_restarts": state.cc_restarts,
+            "lc_replacements": state.lc_replacements,
+        },
+        "final_status": state.last_status.as_ref().map(|s| serde_json::json!({
+            "total_tasks": s.total_tasks,
+            "completed_tasks": s.completed_tasks,
+            "telemetry": serde_json::json!({
+                "total_images": s.telemetry.total_images,
+                "completed_images": s.telemetry.completed_images,
+                "ttl_expirations": s.telemetry.ttl_expirations,
+                "total_assignments": s.telemetry.total_assignments,
+                "total_completions": s.telemetry.total_completions,
+                "per_node_images": s.telemetry.per_node_images,
+                "per_node_completions": s.telemetry.per_node_completions,
+                "per_node_ttl_expirations": s.telemetry.per_node_ttl_expirations,
+                "batch_size": s.telemetry.batch_size,
+            }),
+        })),
+    });
+
+    if let Ok(mut f) = std::fs::File::create(path) {
+        let _ = f.write_all(serde_json::to_string_pretty(&data).unwrap_or_default().as_bytes());
+    }
 }
 
 /// Poll one of the CC addresses for the /status endpoint.
@@ -781,20 +870,61 @@ fn fmt_num(n: u64) -> String {
     result.chars().rev().collect()
 }
 
+/// Response from GET /leader on a CC node.
+#[derive(serde::Deserialize)]
+struct LeaderResponse {
+    leader_address: Option<String>,
+}
+
+/// Probe a single CC address: returns (alive, is_leader).
+fn probe_cc(addr: &str) -> (bool, bool) {
+    let output = Command::new("curl")
+        .args(["-s", "--connect-timeout", "2", "--max-time", "3"])
+        .arg(format!("http://{}/leader", addr))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+    match output {
+        Ok(out) if out.status.success() => {
+            if let Ok(resp) = serde_json::from_slice::<LeaderResponse>(&out.stdout) {
+                let is_leader = resp
+                    .leader_address
+                    .as_deref()
+                    .map_or(false, |la| la == addr);
+                (true, is_leader)
+            } else {
+                (true, false) // responded but couldn't parse — still alive
+            }
+        }
+        _ => (false, false),
+    }
+}
+
 /// Polls CC /status every few seconds and updates the shared dashboard state.
-/// Lightweight (single curl call), so it runs at a higher frequency than the
-/// SSH-based CC/LC monitors.
+/// Also probes each CC individually for alive/leader status.
 fn telemetry_poller(
     cc_addrs: Vec<String>,
     dashboard: Arc<Mutex<DashboardState>>,
     log_buf: LogBuffer,
 ) {
     const POLL_INTERVAL_SECS: u64 = 3;
-    // How many throughput history entries to keep (for sliding window calculation).
     const MAX_HISTORY: usize = 1200; // ~1 hour at 3s interval
 
     loop {
         thread::sleep(Duration::from_secs(POLL_INTERVAL_SECS));
+
+        // Probe each CC for alive/leader status.
+        let statuses: Vec<CcNodeStatus> = cc_addrs
+            .iter()
+            .map(|addr| {
+                let (alive, is_leader) = probe_cc(addr);
+                CcNodeStatus {
+                    addr: addr.clone(),
+                    alive,
+                    is_leader,
+                }
+            })
+            .collect();
 
         if let Some(status) = poll_status(&cc_addrs) {
             let now = std::time::SystemTime::now()
@@ -802,9 +932,18 @@ fn telemetry_poller(
                 .unwrap_or_default()
                 .as_secs();
             let mut d = dashboard.lock().unwrap();
+            d.cc_statuses = statuses;
             d.throughput_history.push((now, status.completed_tasks));
             if d.throughput_history.len() > MAX_HISTORY {
                 d.throughput_history.remove(0);
+            }
+            // Record per-node image history for rate calculation.
+            for (node_id, img_count) in &status.telemetry.per_node_images {
+                let history = d.per_node_history.entry(node_id.clone()).or_default();
+                history.push((now, *img_count));
+                if history.len() > MAX_HISTORY {
+                    history.remove(0);
+                }
             }
             // Freeze the timer when all tasks are completed.
             if d.completed_at.is_none()
@@ -812,13 +951,22 @@ fn telemetry_poller(
                 && status.completed_tasks == status.total_tasks
             {
                 d.completed_at = Some(std::time::Instant::now());
-                drop(d); // release lock before log_msg
-                log_msg!(log_buf, "✅ All tasks completed!");
-                let mut d = dashboard.lock().unwrap();
+                let telemetry_file = d.telemetry_file.clone();
+                let saved = d.telemetry_saved;
                 d.last_status = Some(status);
+                if !saved {
+                    d.telemetry_saved = true;
+                    save_telemetry(&d, &telemetry_file);
+                }
+                drop(d);
+                log_msg!(log_buf, "✅ All tasks completed!");
             } else {
                 d.last_status = Some(status);
             }
+        } else {
+            // No status available but still update CC statuses.
+            let mut d = dashboard.lock().unwrap();
+            d.cc_statuses = statuses;
         }
     }
 }
@@ -832,26 +980,34 @@ fn cc_monitor(
     log_buf: LogBuffer,
 ) {
     const INTERVAL_SECS: u64 = 10;
+    let mut was_down: Vec<bool> = vec![false; cc_entries.len()];
 
     loop {
         thread::sleep(Duration::from_secs(INTERVAL_SECS));
 
-        for (node, binary, args) in cc_entries.iter() {
+        for (i, (node, binary, args)) in cc_entries.iter().enumerate() {
             let alive = ssh_run(node, "pgrep -f inf3203_aika > /dev/null 2>&1");
-            if !alive {
+            if alive {
+                was_down[i] = false;
+                continue;
+            }
+            // Only count the crash once per episode.
+            if !was_down[i] {
+                was_down[i] = true;
                 dashboard.lock().unwrap().cc_crashes += 1;
-                log_msg!(log_buf, "[watchdog] CC on {} not running — restarting…", node);
-                let log_file = format!("{}/cc-{}.log", log_dir, node);
-                if ssh_start(node, binary, args, &log_file) {
-                    dashboard.lock().unwrap().cc_restarts += 1;
-                    log_msg!(log_buf, "[watchdog] CC on {} restarted ok", node);
-                } else {
-                    log_msg!(
-                        log_buf,
-                        "[watchdog] CC on {} restart FAILED — will retry next cycle",
-                        node
-                    );
-                }
+            }
+            log_msg!(log_buf, "[watchdog] CC on {} not running — restarting…", node);
+            let log_file = format!("{}/cc-{}.log", log_dir, node);
+            if ssh_start(node, binary, args, &log_file) {
+                dashboard.lock().unwrap().cc_restarts += 1;
+                was_down[i] = false;
+                log_msg!(log_buf, "[watchdog] CC on {} restarted ok", node);
+            } else {
+                log_msg!(
+                    log_buf,
+                    "[watchdog] CC on {} restart FAILED — will retry next cycle",
+                    node
+                );
             }
         }
     }
@@ -873,9 +1029,10 @@ fn lc_monitor(
 
     let mut lc_entries: Vec<WatchdogEntry> = lc_watchlist
         .into_iter()
-        .map(|(node, _binary, restart_args)| WatchdogEntry {
+        .map(|(node, node_id, restart_args_template)| WatchdogEntry {
             node,
-            restart_args,
+            node_id,
+            restart_args_template,
             failed_attempts: 0,
             down_since: None,
         })
@@ -914,17 +1071,30 @@ fn lc_monitor(
                 continue;
             }
 
-            // Delay elapsed — attempt restart.
+            // Delay elapsed — attempt restart with a fresh port.
+            let port = match find_free_port(&entry.node, 30) {
+                Some(p) => p,
+                None => {
+                    log_msg!(
+                        log_buf,
+                        "[watchdog] LC on {} — no free port, will retry next cycle",
+                        entry.node
+                    );
+                    continue;
+                }
+            };
+            let restart_args = entry.restart_args_template.replace("{PORT}", &port.to_string());
             log_msg!(
                 log_buf,
-                "[watchdog] LC on {} down {}s — restarting as replica (attempt {}/{})…",
+                "[watchdog] LC on {} down {}s — restarting as replica on port {} (attempt {}/{})…",
                 entry.node,
                 down_secs,
+                port,
                 entry.failed_attempts + 1,
                 MAX_RESTART_ATTEMPTS
             );
             let log_file = format!("{}/lc-{}.log", ctx.log_dir, entry.node);
-            if ssh_start(&entry.node, &ctx.binary, &entry.restart_args, &log_file) {
+            if ssh_start(&entry.node, &ctx.binary, &restart_args, &log_file) {
                 log_msg!(log_buf, "[watchdog] LC on {} restarted ok", entry.node);
                 dashboard.lock().unwrap().lc_restarts += 1;
                 entry.down_since = None;
@@ -988,6 +1158,11 @@ fn lc_monitor(
                  --agents 0 --extractor-script {} --image-base-path {} --python {}",
                 node_id, port, ctx.peer_list, ctx.classify_script, IMAGE_DIR, ctx.python
             );
+            let new_restart_template = format!(
+                "local-controller --node-id {} --bind 0.0.0.0:{{PORT}} --cc-addrs {} \
+                 --agents 0 --extractor-script {} --image-base-path {} --python {}",
+                node_id, ctx.peer_list, ctx.classify_script, IMAGE_DIR, ctx.python
+            );
 
             log_msg!(
                 log_buf,
@@ -999,7 +1174,8 @@ fn lc_monitor(
                 log_msg!(log_buf, "[watchdog] Replacement LC on {} started ok", new_node);
                 dashboard.lock().unwrap().lc_replacements += 1;
                 entry.node = new_node;
-                entry.restart_args = new_restart_args;
+                entry.node_id = node_id;
+                entry.restart_args_template = new_restart_template;
                 entry.down_since = None;
                 entry.failed_attempts = 0;
             } else {

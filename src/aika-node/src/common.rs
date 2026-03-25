@@ -171,6 +171,8 @@ pub struct ClusterTelemetry {
     pub per_node_completions: Vec<(String, u64)>,
     /// Per-node image counts: node_id -> images completed by agents on that node.
     pub per_node_images: Vec<(String, u64)>,
+    /// Per-node TTL expiration counts: node_id -> TTL expirations for agents on that node.
+    pub per_node_ttl_expirations: Vec<(String, u64)>,
     /// Number of images per batch (configuration value).
     pub batch_size: usize,
     /// Max images configured (0 = unlimited).
