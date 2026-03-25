@@ -587,6 +587,7 @@ fn main() {
             throughput_history: Vec::new(),
             last_status: None,
             start_time: std::time::Instant::now(),
+            completed_at: None,
         }));
 
         // Run watchdog in a background thread; TUI runs on main thread.
@@ -689,6 +690,8 @@ struct DashboardState {
     throughput_history: Vec<(u64, u64)>,
     last_status: Option<StatusResponse>,
     start_time: std::time::Instant,
+    /// Frozen when all tasks are completed so the timer stops ticking.
+    completed_at: Option<std::time::Instant>,
 }
 
 /// Poll one of the CC addresses for the /status endpoint.
@@ -801,7 +804,19 @@ fn lc_watchdog(
             if d.throughput_history.len() > MAX_HISTORY {
                 d.throughput_history.remove(0);
             }
-            d.last_status = Some(status);
+            // Freeze the timer when all tasks are completed.
+            if d.completed_at.is_none()
+                && status.total_tasks > 0
+                && status.completed_tasks == status.total_tasks
+            {
+                d.completed_at = Some(std::time::Instant::now());
+                drop(d); // release lock before log_msg
+                log_msg!(log_buf, "✅ All tasks completed!");
+                let mut d = dashboard.lock().unwrap();
+                d.last_status = Some(status);
+            } else {
+                d.last_status = Some(status);
+            }
         }
 
         // --- CC monitoring: restart on same node, no replacement ---

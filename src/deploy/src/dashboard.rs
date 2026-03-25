@@ -63,11 +63,13 @@ impl LogBuffer {
     }
 }
 
-/// A macro-friendly logging function that appends to the buffer.
+/// A macro-friendly logging function that appends to the buffer and also prints
+/// to stderr so messages are visible on the terminal before the TUI starts.
 #[macro_export]
 macro_rules! log_msg {
     ($buf:expr, $($arg:tt)*) => {{
         let msg = format!($($arg)*);
+        eprintln!("{}", &msg);
         $buf.push(msg);
     }};
 }
@@ -104,8 +106,9 @@ fn tui_loop(
             draw_ui(f, &state, deploy_info, log_buf);
         })?;
 
-        // Poll for events with a 500ms timeout so the UI refreshes regularly.
-        if event::poll(Duration::from_millis(500))? {
+        // Poll for events with a 200ms timeout so the UI refreshes ~5x/sec.
+        // The CC is still only polled every 10s by the watchdog thread.
+        if event::poll(Duration::from_millis(200))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
                     match key.code {
@@ -138,7 +141,7 @@ fn draw_ui(
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(5),  // Header / deploy info
-            Constraint::Length(6),  // Progress gauges
+            Constraint::Length(7),  // Progress gauges + stats
             Constraint::Min(10),   // Middle section (two columns)
             Constraint::Length(12), // Logs
             Constraint::Length(1),  // Footer
@@ -153,22 +156,42 @@ fn draw_ui(
 }
 
 fn draw_header(f: &mut Frame, area: Rect, info: &DeployInfo, state: &DashboardState) {
-    let elapsed = state.start_time.elapsed().as_secs();
+    // If completed, show frozen completion time; otherwise show live elapsed.
+    let elapsed = if let Some(completed_at) = state.completed_at {
+        completed_at.duration_since(state.start_time).as_secs()
+    } else {
+        state.start_time.elapsed().as_secs()
+    };
 
-    let lines = vec![
-        Line::from(vec![
+    let timer_spans = if state.completed_at.is_some() {
+        vec![
             Span::styled(
-                " Áika Cluster Dashboard ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+                format!("✅ Completed in {}", fmt_duration(elapsed)),
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
             ),
-            Span::raw("  "),
+        ]
+    } else {
+        vec![
             Span::styled(
                 format!("⏱ {}", fmt_duration(elapsed)),
                 Style::default().fg(Color::Yellow),
             ),
-        ]),
+        ]
+    };
+
+    let mut title_spans = vec![
+        Span::styled(
+            " Áika Cluster Dashboard ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+    ];
+    title_spans.extend(timer_spans);
+
+    let lines = vec![
+        Line::from(title_spans),
         Line::from(vec![
             Span::styled(" CCs: ", Style::default().fg(Color::DarkGray)),
             Span::raw(info.cc_addrs.join("  ")),
@@ -218,6 +241,7 @@ fn draw_progress(f: &mut Frame, area: Rect, state: &DashboardState) {
             Constraint::Length(1), // Batch gauge
             Constraint::Length(1), // Image gauge
             Constraint::Length(1), // Throughput + ETA
+            Constraint::Length(1), // Extra stats
             Constraint::Min(0),
         ])
         .split(inner);
@@ -295,6 +319,38 @@ fn draw_progress(f: &mut Frame, area: Rect, state: &DashboardState) {
             Span::styled(eta, Style::default().fg(Color::White)),
         ]);
         f.render_widget(Paragraph::new(throughput_line), chunks[2]);
+
+        // Extra stats line: efficiency, batch size, avg batch/s
+        let efficiency = if t.total_assignments > 0 {
+            format!(
+                "{:.1}%",
+                t.total_completions as f64 / t.total_assignments as f64 * 100.0
+            )
+        } else {
+            "-".to_string()
+        };
+        let (throughput_batch_avg, _) = calc_throughput_batches(state);
+        let extra_line = Line::from(vec![
+            Span::styled(
+                format!(" Efficiency: {}", efficiency),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                " (completions/assignments)",
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("Batch size: {}", t.batch_size),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("Avg: {:.2} batch/s", throughput_batch_avg),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+        f.render_widget(Paragraph::new(extra_line), chunks[3]);
     } else {
         let waiting = Paragraph::new(Line::from(Span::styled(
             " Waiting for cluster status… (CCs may still be electing a leader)",
@@ -616,6 +672,43 @@ fn calc_throughput(state: &DashboardState, batch_size: usize) -> (f64, f64) {
         let dt = now_entry.0.saturating_sub(old_entry.0);
         if dt > 0 {
             (now_entry.1 - old_entry.1) as f64 / dt as f64 * batch_size as f64
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    };
+
+    (avg, recent)
+}
+
+/// Returns (avg_batch_per_sec, recent_batch_per_sec) without multiplying by batch_size.
+fn calc_throughput_batches(state: &DashboardState) -> (f64, f64) {
+    let avg = if state.throughput_history.len() >= 2 {
+        let (t1, c1) = state.throughput_history.first().unwrap();
+        let (t2, c2) = state.throughput_history.last().unwrap();
+        let dt = t2.saturating_sub(*t1);
+        if dt > 0 {
+            (c2 - c1) as f64 / dt as f64
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    };
+
+    let recent = if state.throughput_history.len() >= 2 {
+        let now_entry = state.throughput_history.last().unwrap();
+        let cutoff = now_entry.0.saturating_sub(60);
+        let old_entry = state
+            .throughput_history
+            .iter()
+            .rev()
+            .find(|(ts, _)| *ts <= cutoff)
+            .unwrap_or(state.throughput_history.first().unwrap());
+        let dt = now_entry.0.saturating_sub(old_entry.0);
+        if dt > 0 {
+            (now_entry.1 - old_entry.1) as f64 / dt as f64
         } else {
             0.0
         }
