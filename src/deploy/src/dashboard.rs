@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::io;
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -11,7 +13,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Table, Wrap},
+    widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Table},
     Frame, Terminal,
 };
 
@@ -27,6 +29,17 @@ pub struct DeployInfo {
     pub num_cc: usize,
     pub num_lc: usize,
     pub nodes_file: String,
+    /// CC hostnames (for the selectable node list).
+    pub cc_nodes: Vec<String>,
+    /// LC hostnames in order: replica first, then active.
+    pub lc_nodes: Vec<String>,
+}
+
+/// TUI-local interactive state (not shared with background threads).
+struct TuiState {
+    selected_node: usize,
+    show_results: bool,
+    label_counts: Option<Vec<(String, u64)>>,
 }
 
 /// Thread-safe log buffer that captures messages for the TUI.
@@ -100,14 +113,20 @@ fn tui_loop(
     deploy_info: &DeployInfo,
     log_buf: &LogBuffer,
 ) -> io::Result<()> {
+    let mut tui = TuiState {
+        selected_node: 0,
+        show_results: false,
+        label_counts: None,
+    };
+    let total_nodes = deploy_info.cc_nodes.len() + deploy_info.lc_nodes.len();
+
     loop {
         terminal.draw(|f| {
             let state = state.lock().unwrap();
-            draw_ui(f, &state, deploy_info, log_buf);
+            draw_ui(f, &state, deploy_info, log_buf, &tui);
         })?;
 
         // Poll for events with a 200ms timeout so the UI refreshes ~5x/sec.
-        // The CC is still only polled every 10s by the watchdog thread.
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
@@ -119,6 +138,32 @@ fn tui_loop(
                                 .contains(crossterm::event::KeyModifiers::CONTROL) =>
                         {
                             return Ok(());
+                        }
+                        KeyCode::Up => {
+                            if total_nodes > 0 {
+                                tui.selected_node = if tui.selected_node == 0 {
+                                    total_nodes - 1
+                                } else {
+                                    tui.selected_node - 1
+                                };
+                            }
+                        }
+                        KeyCode::Down => {
+                            if total_nodes > 0 {
+                                tui.selected_node = (tui.selected_node + 1) % total_nodes;
+                            }
+                        }
+                        KeyCode::Char('k') | KeyCode::Char('K') => {
+                            if total_nodes > 0 {
+                                let hostname = node_hostname(deploy_info, tui.selected_node);
+                                kill_node(&hostname, log_buf);
+                            }
+                        }
+                        KeyCode::Char('r') | KeyCode::Char('R') => {
+                            tui.show_results = !tui.show_results;
+                            if tui.show_results && tui.label_counts.is_none() {
+                                tui.label_counts = Some(load_results(&deploy_info.results_dir));
+                            }
                         }
                         _ => {}
                     }
@@ -133,6 +178,7 @@ fn draw_ui(
     state: &DashboardState,
     deploy_info: &DeployInfo,
     log_buf: &LogBuffer,
+    tui: &TuiState,
 ) {
     let area = f.area();
 
@@ -150,9 +196,9 @@ fn draw_ui(
 
     draw_header(f, main_chunks[0], deploy_info, state);
     draw_progress(f, main_chunks[1], state);
-    draw_middle(f, main_chunks[2], state);
+    draw_middle(f, main_chunks[2], state, deploy_info, tui);
     draw_logs(f, main_chunks[3], log_buf);
-    draw_footer(f, main_chunks[4]);
+    draw_footer(f, main_chunks[4], tui);
 }
 
 fn draw_header(f: &mut Frame, area: Rect, info: &DeployInfo, state: &DashboardState) {
@@ -320,33 +366,49 @@ fn draw_progress(f: &mut Frame, area: Rect, state: &DashboardState) {
         ]);
         f.render_widget(Paragraph::new(throughput_line), chunks[2]);
 
-        // Extra stats line: efficiency, batch size, avg batch/s
-        let efficiency = if t.total_assignments > 0 {
-            format!(
-                "{:.1}%",
-                t.total_completions as f64 / t.total_assignments as f64 * 100.0
-            )
-        } else {
-            "-".to_string()
-        };
+        // Fault tolerance stats line
         let (throughput_batch_avg, _) = calc_throughput_batches(state);
         let extra_line = Line::from(vec![
             Span::styled(
-                format!(" Efficiency: {}", efficiency),
-                Style::default().fg(Color::DarkGray),
+                format!(" TTL: {}", t.ttl_expirations),
+                Style::default().fg(if t.ttl_expirations > 0 {
+                    Color::Yellow
+                } else {
+                    Color::DarkGray
+                }),
             ),
+            Span::raw("  "),
             Span::styled(
-                " (completions/assignments)",
+                format!(
+                    "LC ×{} ↻{}",
+                    state.lc_crashes, state.lc_restarts
+                ),
+                Style::default().fg(if state.lc_crashes > 0 {
+                    Color::Red
+                } else {
+                    Color::DarkGray
+                }),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!(
+                    "CC ×{} ↻{}",
+                    state.cc_crashes, state.cc_restarts
+                ),
+                Style::default().fg(if state.cc_crashes > 0 {
+                    Color::Red
+                } else {
+                    Color::DarkGray
+                }),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("Batch: {}×{}", t.batch_size, fmt_num(status.total_tasks)),
                 Style::default().fg(Color::DarkGray),
             ),
             Span::raw("  "),
             Span::styled(
-                format!("Batch size: {}", t.batch_size),
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                format!("Avg: {:.2} batch/s", throughput_batch_avg),
+                format!("{:.2} batch/s", throughput_batch_avg),
                 Style::default().fg(Color::DarkGray),
             ),
         ]);
@@ -360,149 +422,119 @@ fn draw_progress(f: &mut Frame, area: Rect, state: &DashboardState) {
     }
 }
 
-fn draw_middle(f: &mut Frame, area: Rect, state: &DashboardState) {
+fn draw_middle(f: &mut Frame, area: Rect, state: &DashboardState, deploy_info: &DeployInfo, tui: &TuiState) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
         .split(area);
 
-    draw_fault_tolerance(f, chunks[0], state);
-    draw_per_node(f, chunks[1], state);
+    draw_nodes(f, chunks[0], state, deploy_info, tui.selected_node);
+    if tui.show_results {
+        draw_results(f, chunks[1], &tui.label_counts);
+    } else {
+        draw_per_node(f, chunks[1], state);
+    }
 }
 
-fn draw_fault_tolerance(f: &mut Frame, area: Rect, state: &DashboardState) {
+fn draw_nodes(
+    f: &mut Frame,
+    area: Rect,
+    state: &DashboardState,
+    deploy_info: &DeployInfo,
+    selected: usize,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Red))
-        .title(" Fault Tolerance & Nodes ");
+        .title(" Nodes [↑↓ select, k kill] ");
 
-    let mut lines = Vec::new();
+    let inner = block.inner(area);
+    f.render_widget(block, area);
 
-    if let Some(ref status) = state.last_status {
-        let t = &status.telemetry;
+    let cc_count = deploy_info.cc_nodes.len();
+    let mut rows: Vec<Row> = Vec::new();
 
-        lines.push(Line::from(vec![
-            Span::styled(
-                " TTL Expirations: ",
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled(
-                format!("{}", t.ttl_expirations),
-                Style::default().fg(if t.ttl_expirations > 0 {
-                    Color::Yellow
-                } else {
-                    Color::Green
-                }),
-            ),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled(" Assignments: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(fmt_num(t.total_assignments)),
-            Span::raw("   "),
-            Span::styled("Completions: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(fmt_num(t.total_completions)),
-        ]));
-
-        if t.max_images > 0 {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    " Max images: ",
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(
-                    format!("{} (limited)", fmt_num(t.max_images)),
-                    Style::default().fg(Color::Yellow),
-                ),
-            ]));
-        }
-
-        lines.push(Line::from(""));
-
-        lines.push(Line::from(vec![
-            Span::styled(" LC  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("crashes: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{}", state.lc_crashes),
-                Style::default().fg(if state.lc_crashes > 0 {
-                    Color::Red
-                } else {
-                    Color::Green
-                }),
-            ),
-            Span::raw("  "),
-            Span::styled("restarts: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(format!("{}", state.lc_restarts)),
-            Span::raw("  "),
-            Span::styled("replacements: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(format!("{}", state.lc_replacements)),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled(" CC  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("crashes: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{}", state.cc_crashes),
-                Style::default().fg(if state.cc_crashes > 0 {
-                    Color::Red
-                } else {
-                    Color::Green
-                }),
-            ),
-            Span::raw("  "),
-            Span::styled("restarts: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(format!("{}", state.cc_restarts)),
-        ]));
-
-        lines.push(Line::from(""));
-
-        // Registered nodes info
-        let total_agents: usize = status.registered_nodes.iter().map(|n| n.agent_count).sum();
-        let active_lcs = status
-            .registered_nodes
-            .iter()
-            .filter(|n| n.agent_count > 0)
-            .count();
-        let replica_lcs = status
-            .registered_nodes
-            .iter()
-            .filter(|n| n.agent_count == 0)
-            .count();
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!(" {} active LC", active_lcs),
-                Style::default().fg(Color::Green),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                format!("{} replica", replica_lcs),
-                Style::default().fg(Color::Yellow),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                format!("{} agents", total_agents),
-                Style::default().fg(Color::Cyan),
-            ),
-        ]));
-
-        if !status.stale_nodes.is_empty() {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    " ⚠ Stale: ",
-                    Style::default()
-                        .fg(Color::Red)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(status.stale_nodes.join(", ")),
-            ]));
-        }
-    } else {
-        lines.push(Line::from(Span::styled(
-            " No data yet",
-            Style::default().fg(Color::DarkGray),
-        )));
+    for (i, hostname) in deploy_info.cc_nodes.iter().enumerate() {
+        let style = if i == selected {
+            Style::default()
+                .bg(Color::DarkGray)
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        rows.push(
+            Row::new(vec![
+                Cell::from(format!("CC{}", i + 1)).style(Style::default().fg(Color::Cyan)),
+                Cell::from(hostname.as_str()),
+                Cell::from("—"),
+            ])
+            .style(style),
+        );
     }
 
-    let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
-    f.render_widget(para, area);
+    for (i, hostname) in deploy_info.lc_nodes.iter().enumerate() {
+        let global_idx = cc_count + i;
+        let lc_id = format!("lc-{}", hostname);
+
+        let agent_info = state
+            .last_status
+            .as_ref()
+            .and_then(|s| s.registered_nodes.iter().find(|n| n.node_id == lc_id));
+        let stale = state
+            .last_status
+            .as_ref()
+            .map_or(false, |s| s.stale_nodes.contains(&lc_id));
+
+        let status_str = if stale {
+            "⚠ stale".to_string()
+        } else if let Some(node) = agent_info {
+            if node.agent_count > 0 {
+                format!("{} agents", node.agent_count)
+            } else {
+                "replica".to_string()
+            }
+        } else {
+            "—".to_string()
+        };
+
+        let status_color = if stale {
+            Color::Red
+        } else if agent_info.is_some_and(|n| n.agent_count > 0) {
+            Color::Green
+        } else if agent_info.is_some() {
+            Color::Yellow
+        } else {
+            Color::DarkGray
+        };
+
+        let style = if global_idx == selected {
+            Style::default()
+                .bg(Color::DarkGray)
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+
+        rows.push(
+            Row::new(vec![
+                Cell::from("LC").style(Style::default().fg(Color::Blue)),
+                Cell::from(hostname.as_str()),
+                Cell::from(status_str).style(Style::default().fg(status_color)),
+            ])
+            .style(style),
+        );
+    }
+
+    let widths = [
+        Constraint::Length(4),
+        Constraint::Min(10),
+        Constraint::Length(12),
+    ];
+
+    let table = Table::new(rows, widths).column_spacing(1);
+    f.render_widget(table, inner);
 }
 
 fn draw_per_node(f: &mut Frame, area: Rect, state: &DashboardState) {
@@ -597,6 +629,91 @@ fn draw_per_node(f: &mut Frame, area: Rect, state: &DashboardState) {
     }
 }
 
+fn draw_results(f: &mut Frame, area: Rect, label_counts: &Option<Vec<(String, u64)>>) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta))
+        .title(" Results — Images per Label ");
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let Some(counts) = label_counts else {
+        let para = Paragraph::new(Line::from(Span::styled(
+            " Loading…",
+            Style::default().fg(Color::DarkGray),
+        )));
+        f.render_widget(para, inner);
+        return;
+    };
+
+    if counts.is_empty() {
+        let para = Paragraph::new(Line::from(Span::styled(
+            " No results found yet (press r to refresh)",
+            Style::default().fg(Color::Yellow),
+        )));
+        f.render_widget(para, inner);
+        return;
+    }
+
+    let max_count = counts.first().map(|(_, c)| *c).unwrap_or(1);
+    let total: u64 = counts.iter().map(|(_, c)| *c).sum();
+
+    let header = Row::new(vec![
+        Cell::from("Label").style(Style::default().add_modifier(Modifier::BOLD)),
+        Cell::from("Count").style(Style::default().add_modifier(Modifier::BOLD)),
+        Cell::from("Bar").style(Style::default().add_modifier(Modifier::BOLD)),
+    ]);
+
+    let rows: Vec<Row> = counts
+        .iter()
+        .map(|(label, count)| {
+            let bar_width: usize = 20;
+            let filled = if max_count > 0 {
+                ((*count as f64 / max_count as f64) * bar_width as f64) as usize
+            } else {
+                0
+            };
+            let bar = format!(
+                "{}{}",
+                "█".repeat(filled),
+                "░".repeat(bar_width.saturating_sub(filled))
+            );
+
+            Row::new(vec![
+                Cell::from(label.as_str()),
+                Cell::from(fmt_num(*count)),
+                Cell::from(bar),
+            ])
+        })
+        .collect();
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(inner);
+
+    let summary = format!(" {} labels, {} images total", counts.len(), fmt_num(total));
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            summary,
+            Style::default().fg(Color::Cyan),
+        ))),
+        chunks[0],
+    );
+
+    let widths = [
+        Constraint::Min(15),
+        Constraint::Length(10),
+        Constraint::Length(22),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header.style(Style::default().fg(Color::Magenta)))
+        .column_spacing(1);
+    f.render_widget(table, chunks[1]);
+}
+
 fn draw_logs(f: &mut Frame, area: Rect, log_buf: &LogBuffer) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -626,7 +743,12 @@ fn draw_logs(f: &mut Frame, area: Rect, log_buf: &LogBuffer) {
     f.render_widget(para, area);
 }
 
-fn draw_footer(f: &mut Frame, area: Rect) {
+fn draw_footer(f: &mut Frame, area: Rect, tui: &TuiState) {
+    let results_label = if tui.show_results {
+        "r throughput"
+    } else {
+        "r results"
+    };
     let footer = Paragraph::new(Line::from(vec![
         Span::styled(
             " q",
@@ -636,12 +758,26 @@ fn draw_footer(f: &mut Frame, area: Rect) {
         ),
         Span::raw(" quit  "),
         Span::styled(
-            "Ctrl+C",
+            "↑↓",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(" stop watchdog"),
+        Span::raw(" select  "),
+        Span::styled(
+            "k",
+            Style::default()
+                .fg(Color::Red)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" kill node  "),
+        Span::styled(
+            "r",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!(" {}", results_label)),
     ]));
     f.render_widget(footer, area);
 }
@@ -717,4 +853,90 @@ fn calc_throughput_batches(state: &DashboardState) -> (f64, f64) {
     };
 
     (avg, recent)
+}
+
+/// Get the hostname of the node at the given index in the combined CC+LC list.
+fn node_hostname(info: &DeployInfo, index: usize) -> String {
+    if index < info.cc_nodes.len() {
+        info.cc_nodes[index].clone()
+    } else {
+        info.lc_nodes[index - info.cc_nodes.len()].clone()
+    }
+}
+
+/// Kill all aika processes on a node via SSH (runs in background thread).
+fn kill_node(hostname: &str, log_buf: &LogBuffer) {
+    let hostname = hostname.to_string();
+    let log_buf = log_buf.clone();
+    std::thread::spawn(move || {
+        log_buf.push(format!("⚡ Killing aika processes on {}…", hostname));
+        let result = std::process::Command::new("ssh")
+            .args([
+                "-n",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=5",
+                "-o",
+                "StrictHostKeyChecking=no",
+                &hostname,
+            ])
+            .arg("pkill -f inf3203_aika")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        match result {
+            Ok(s) if s.success() => {
+                log_buf.push(format!("⚡ Killed processes on {}", hostname));
+            }
+            Ok(_) => {
+                log_buf.push(format!(
+                    "⚡ No aika processes on {} (already dead?)",
+                    hostname
+                ));
+            }
+            Err(e) => {
+                log_buf.push(format!("⚡ SSH to {} failed: {}", hostname, e));
+            }
+        }
+    });
+}
+
+/// Read results NDJSON files and count images per label.
+fn load_results(results_dir: &str) -> Vec<(String, u64)> {
+    let mut label_counts: HashMap<String, u64> = HashMap::new();
+
+    let entries = match std::fs::read_dir(results_dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !name.starts_with("results_") || !name.ends_with(".ndjson") {
+            continue;
+        }
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                    if let Some(labels) = v["labels"].as_array() {
+                        for pair in labels {
+                            if let Some(label) = pair.get(1).and_then(|l| l.as_str()) {
+                                *label_counts.entry(label.to_string()).or_insert(0) += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut result: Vec<(String, u64)> = label_counts.into_iter().collect();
+    result.sort_by(|a, b| b.1.cmp(&a.1));
+    result
 }

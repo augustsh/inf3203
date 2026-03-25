@@ -30,7 +30,7 @@ use dashboard::{DeployInfo, LogBuffer};
 const VERSION: &str = "v0.0.1"; // replaced by CI at release
 
 const NUM_CC: usize = 3;
-const AGENTS_PER_LC: usize = 4;
+const AGENTS_PER_LC: usize = 2;
 
 const IMAGE_DIR: &str = "/share/inf3203/unlabeled_images";
 
@@ -576,6 +576,8 @@ fn main() {
             num_cc: NUM_CC,
             num_lc: nodes.len().saturating_sub(NUM_CC),
             nodes_file: nodes_file.display().to_string(),
+            cc_nodes: cc_nodes.to_vec(),
+            lc_nodes: lc_nodes.to_vec(),
         };
 
         let dashboard_state = Arc::new(Mutex::new(DashboardState {
