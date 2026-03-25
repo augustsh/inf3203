@@ -73,7 +73,11 @@ pub async fn run(config: LocalControllerConfig) -> anyhow::Result<()> {
     let bind = config.bind;
 
     let state = Arc::new(Mutex::new(LocalControllerState::new(config)));
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(5))
+        .build()
+        .expect("failed to build HTTP client");
     let app = AppState {
         state: Arc::clone(&state),
         client,
@@ -179,14 +183,28 @@ async fn find_leader(app: &AppState) -> anyhow::Result<String> {
 /// Forward a POST request to the CC leader, updating the leader cache from the
 /// response URL (reqwest auto-follows 3xx redirects from non-leader CCs).
 ///
-/// Retries once after clearing the cache if the first attempt fails.
+/// Retries up to 3 times after clearing the cache if an attempt fails.
 async fn proxy_to_leader<B, R>(app: &AppState, path: &str, body: &B) -> anyhow::Result<R>
 where
     B: serde::Serialize,
     R: for<'de> serde::Deserialize<'de>,
 {
-    for attempt in 0..2u32 {
-        let leader = find_leader(app).await?;
+    const MAX_ATTEMPTS: u32 = 3;
+    for attempt in 0..MAX_ATTEMPTS {
+        let leader = match find_leader(app).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(
+                    "Proxy attempt {}/{} to {}: leader discovery failed: {}",
+                    attempt + 1,
+                    MAX_ATTEMPTS,
+                    path,
+                    e
+                );
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+        };
         let url = format!("http://{}{}", leader, path);
 
         match app.client.post(&url).json(body).send().await {
@@ -215,14 +233,21 @@ where
                 }
 
                 tracing::warn!(
-                    "Proxy attempt {}/2 to {} returned {}",
+                    "Proxy attempt {}/{} to {} returned {}",
                     attempt + 1,
+                    MAX_ATTEMPTS,
                     path,
                     status
                 );
             }
             Err(e) => {
-                tracing::warn!("Proxy attempt {}/2 to {} failed: {}", attempt + 1, path, e);
+                tracing::warn!(
+                    "Proxy attempt {}/{} to {} failed: {}",
+                    attempt + 1,
+                    MAX_ATTEMPTS,
+                    path,
+                    e
+                );
             }
         }
 
@@ -230,7 +255,11 @@ where
         app.state.lock().await.current_leader = None;
     }
 
-    anyhow::bail!("Failed to proxy {} to CC leader after 2 attempts", path)
+    anyhow::bail!(
+        "Failed to proxy {} to CC leader after {} attempts",
+        path,
+        MAX_ATTEMPTS
+    )
 }
 
 // endregion
