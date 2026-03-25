@@ -316,18 +316,18 @@ impl RaftNode {
                         }
 
                         // Append while holding both locks (consistent ordering).
-                        let (entry_index, all_entries) = {
+                        let (entry_index, new_entry) = {
                             let state_guard = el_state.lock().await;
                             let mut log_guard = el_log.lock().await;
                             let term = state_guard.persistent.current_term;
                             let idx = log_guard.append_command(term, cmd);
-                            let entries = log_guard.entries_from(1);
-                            (idx, entries)
+                            let entry = log_guard.get(idx).unwrap().clone();
+                            (idx, entry)
                             // locks released here
                         };
 
-                        // Persist the updated log to disk.
-                        if let Err(e) = el_storage.save_log(&all_entries) {
+                        // Append only the new entry to disk (O(1) instead of O(n)).
+                        if let Err(e) = el_storage.append_log_entries(&[new_entry]) {
                             tracing::error!("failed to persist log on propose: {e}");
                             let _ = reply_tx.send(Err(anyhow::anyhow!("log persistence failed: {e}")));
                             continue;

@@ -182,13 +182,16 @@ impl<C: Clone + std::fmt::Debug> RaftLog<C> {
     ///      has a **different term**, truncate the log from that point.
     ///   2. Append any entries that follow the now-truncated (or intact) log.
     ///
-    /// `prev_log_index` is the index of the entry immediately preceding the
-    /// batch (the `prevLogIndex` field from `AppendEntries`).
+    /// Returns `(truncated, new_entries)`:
+    ///   - `truncated`: whether a conflicting suffix was removed (requires full rewrite to disk).
+    ///   - `new_entries`: the entries that were actually appended (for incremental persistence).
     pub fn append_entries_from_leader(
         &mut self,
         _prev_log_index: LogIndex,
         entries: Vec<LogEntry<C>>,
-    ) {
+    ) -> (bool, Vec<LogEntry<C>>) {
+        let mut truncated = false;
+        let mut new_entries = Vec::new();
         for entry in entries {
             match self.get(entry.index) {
                 Some(existing) if existing.term == entry.term => {
@@ -199,13 +202,16 @@ impl<C: Clone + std::fmt::Debug> RaftLog<C> {
                     // Conflict: existing entry at same index has different term.
                     // Truncate from here and fall through to append.
                     self.truncate_from(entry.index - 1);
+                    truncated = true;
                 }
                 None => {
                     // No entry at this index — fall through to append.
                 }
             }
+            new_entries.push(entry.clone());
             self.entries.push(entry);
         }
+        (truncated, new_entries)
     }
 
     // endregion

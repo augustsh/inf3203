@@ -614,16 +614,23 @@ where
         }
 
         // 6. Append entries from leader.
-        let had_new_entries = !args.entries.is_empty();
-        log_guard.append_entries_from_leader(args.prev_log_index, args.entries);
+        let (truncated, new_entries) =
+            log_guard.append_entries_from_leader(args.prev_log_index, args.entries);
 
         // Persist the updated log before advancing commit_index.
         // Raft §8: a follower must durably record entries before acknowledging
         // AppendEntries, so a crash-restart cannot lose entries the leader
         // believes are safely replicated.
-        if had_new_entries {
-            let all_entries = log_guard.entries_from(1);
-            if let Err(e) = storage.save_log(&all_entries) {
+        if !new_entries.is_empty() {
+            let persist_result = if truncated {
+                // Conflict caused truncation — must rewrite the full log.
+                let all_entries = log_guard.entries_from(1);
+                storage.save_log(&all_entries)
+            } else {
+                // No conflict — append only the new entries (O(new) not O(total)).
+                storage.append_log_entries(&new_entries)
+            };
+            if let Err(e) = persist_result {
                 warn!("follower log persist failed: {e}");
                 return AppendEntriesReply {
                     term: current_term,
