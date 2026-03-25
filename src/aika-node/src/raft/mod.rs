@@ -326,10 +326,12 @@ impl RaftNode {
                             // locks released here
                         };
 
-                        // Persist the updated log to disk (synchronous but fast).
-                        el_storage
-                            .save_log(&all_entries)
-                            .expect("failed to persist log on propose");
+                        // Persist the updated log to disk.
+                        if let Err(e) = el_storage.save_log(&all_entries) {
+                            tracing::error!("failed to persist log on propose: {e}");
+                            let _ = reply_tx.send(Err(anyhow::anyhow!("log persistence failed: {e}")));
+                            continue;
+                        }
 
                         pending.insert(entry_index, reply_tx);
 

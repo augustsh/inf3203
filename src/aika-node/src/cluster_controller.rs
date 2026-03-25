@@ -279,11 +279,22 @@ pub async fn run(config: ClusterControllerConfig) -> anyhow::Result<()> {
         let ingest_app = app.clone();
         tokio::spawn(async move {
             let mut was_leader = false;
+            let mut ingestion_complete = false;
             loop {
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 let is_leader = ingest_app.raft.is_leader();
-                if is_leader && !was_leader {
-                    ingest_image_tasks(&ingest_app, &image_dir, batch_size).await;
+                if !is_leader {
+                    was_leader = false;
+                    ingestion_complete = false;
+                    continue;
+                }
+                if !was_leader || !ingestion_complete {
+                    ingestion_complete =
+                        ingest_image_tasks(&ingest_app, &image_dir, batch_size).await;
+                    if !ingestion_complete {
+                        // Back off before retrying failed ingestion.
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
                 }
                 was_leader = is_leader;
             }
@@ -538,7 +549,9 @@ async fn ttl_reaper_loop(app: AppState, ttl_secs: u64) {
 /// Resumable: reads `next_batch_id` from the state machine and skips the
 /// corresponding prefix of the sorted image list, so a new leader after a
 /// mid-ingestion crash picks up exactly where the previous leader left off.
-async fn ingest_image_tasks(app: &AppState, image_dir: &str, batch_size: usize) {
+/// Returns `true` if all batches were successfully ingested, `false` if
+/// ingestion was partial and should be retried.
+async fn ingest_image_tasks(app: &AppState, image_dir: &str, batch_size: usize) -> bool {
     tracing::info!(
         "Ingesting image tasks from {} (batch_size={})",
         image_dir,
@@ -568,13 +581,13 @@ async fn ingest_image_tasks(app: &AppState, image_dir: &str, batch_size: usize) 
         }
         Err(e) => {
             tracing::error!("Cannot open image dir {}: {}", image_dir, e);
-            return;
+            return false;
         }
     };
 
     if names.is_empty() {
         tracing::warn!("No image files found in {}", image_dir);
-        return;
+        return false;
     }
 
     names.sort_unstable();
@@ -588,7 +601,7 @@ async fn ingest_image_tasks(app: &AppState, image_dir: &str, batch_size: usize) 
             "All {} batches already ingested — nothing to do",
             total_batches
         );
-        return;
+        return true;
     }
 
     tracing::info!(
@@ -609,13 +622,13 @@ async fn ingest_image_tasks(app: &AppState, image_dir: &str, batch_size: usize) 
             .await
         {
             tracing::error!("Failed to propose AddTaskBatch {}: {}", next_id, e);
-            // Non-fatal — TTL reaper or retry can handle partial ingestion.
-            break;
+            return false;
         }
         next_id += 1;
     }
 
     tracing::info!("Ingestion complete: {} batches proposed", next_id);
+    true
 }
 
 /// Monitor local controller liveness with two-stage failover.
