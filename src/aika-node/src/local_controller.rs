@@ -15,6 +15,8 @@ pub struct LocalControllerConfig {
     pub extractor_script: String,
     pub image_base_path: String,
     pub python: String,
+    /// Number of OpenMP threads per agent. 0 = auto (total_cores / agent_count).
+    pub omp_threads: usize,
 }
 
 /// Tracks the state of a locally managed agent process.
@@ -87,8 +89,9 @@ pub async fn run(config: LocalControllerConfig) -> anyhow::Result<()> {
     // No other tasks are running yet so holding the lock here is fine.
     if agent_count > 0 {
         // Extract config data without holding the lock during the spawn syscalls.
-        let (node_id, lc_port, cc_addrs, extractor_script, image_base_path, python) = {
+        let (node_id, lc_port, cc_addrs, extractor_script, image_base_path, python, omp_threads) = {
             let g = state.lock().await;
+            let omp = effective_omp_threads(g.config.omp_threads, g.config.agent_count);
             (
                 g.config.node_id.clone(),
                 g.config.bind.port(),
@@ -96,9 +99,19 @@ pub async fn run(config: LocalControllerConfig) -> anyhow::Result<()> {
                 g.config.extractor_script.clone(),
                 g.config.image_base_path.clone(),
                 g.config.python.clone(),
+                omp,
             )
         };
         let lc_addr = format!("127.0.0.1:{}", lc_port);
+
+        tracing::info!(
+            "OMP_NUM_THREADS per agent: {}",
+            if omp_threads == 0 {
+                "default (all cores)".to_string()
+            } else {
+                omp_threads.to_string()
+            }
+        );
 
         let mut spawned = Vec::with_capacity(agent_count);
         for i in 0..agent_count {
@@ -110,6 +123,7 @@ pub async fn run(config: LocalControllerConfig) -> anyhow::Result<()> {
                 &extractor_script,
                 &image_base_path,
                 &python,
+                omp_threads,
             ) {
                 Ok(agent) => {
                     tracing::info!("Spawned agent {}", agent_id);
@@ -274,6 +288,7 @@ fn spawn_agent(
     extractor_script: &str,
     image_base_path: &str,
     python: &str,
+    omp_threads: usize,
 ) -> anyhow::Result<ManagedAgent> {
     let exe = std::env::current_exe()
         .map_err(|e| anyhow::anyhow!("Cannot determine current executable: {}", e))?;
@@ -292,6 +307,8 @@ fn spawn_agent(
         .arg(image_base_path)
         .arg("--python")
         .arg(python)
+        .arg("--omp-threads")
+        .arg(omp_threads.to_string())
         .spawn()
         .map_err(|e| anyhow::anyhow!("Failed to spawn agent process: {}", e))?;
 
@@ -315,7 +332,7 @@ async fn agent_health_loop(app: AppState, interval_secs: u64) {
 
         // Collect IDs of dead agents and config data needed for respawning —
         // all under a single short-lived lock.
-        let (dead_ids, lc_addr, cc_addrs, extractor_script, image_base_path, python) = {
+        let (dead_ids, lc_addr, cc_addrs, extractor_script, image_base_path, python, omp_threads) = {
             let mut g = app.state.lock().await;
             let lc_port = g.config.bind.port();
             let lc_addr = format!("127.0.0.1:{}", lc_port);
@@ -323,6 +340,7 @@ async fn agent_health_loop(app: AppState, interval_secs: u64) {
             let extractor_script = g.config.extractor_script.clone();
             let image_base_path = g.config.image_base_path.clone();
             let python = g.config.python.clone();
+            let omp = effective_omp_threads(g.config.omp_threads, g.config.agent_count);
 
             let mut dead_ids = Vec::new();
             for (id, agent) in g.agents.iter_mut() {
@@ -347,6 +365,7 @@ async fn agent_health_loop(app: AppState, interval_secs: u64) {
                 extractor_script,
                 image_base_path,
                 python,
+                omp,
             )
         }; // Lock released before spawning.
 
@@ -360,6 +379,7 @@ async fn agent_health_loop(app: AppState, interval_secs: u64) {
                 &extractor_script,
                 &image_base_path,
                 &python,
+                omp_threads,
             ) {
                 Ok(agent) => {
                     tracing::info!("Respawned agent {}", agent_id);
@@ -506,6 +526,7 @@ async fn handle_activate(
     let lc_addr = format!("127.0.0.1:{}", g.config.bind.port());
     let cc_addrs = g.config.cc_addrs.clone();
     let node_id = g.config.node_id.clone();
+    let omp_threads = effective_omp_threads(g.config.omp_threads, req.agent_count);
 
     // Spawn agents outside the lock (process creation can be slow).
     drop(g);
@@ -520,6 +541,7 @@ async fn handle_activate(
             &req.extractor_script,
             &req.image_base_path,
             &req.python,
+            omp_threads,
         ) {
             Ok(agent) => {
                 tracing::info!("Spawned agent {}", agent_id);
@@ -593,6 +615,32 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// Compute the effective OMP_NUM_THREADS value for each agent.
+///
+/// - If `configured` > 0, use it as-is (explicit override).
+/// - If `configured` == 0 and `agent_count` <= 1, return 0 (let PyTorch use all cores).
+/// - If `configured` == 0 and `agent_count` > 1, auto-partition: total_cores / agent_count.
+fn effective_omp_threads(configured: usize, agent_count: usize) -> usize {
+    if configured > 0 {
+        return configured;
+    }
+    if agent_count <= 1 {
+        return 0; // single agent — let it use all cores
+    }
+    // Auto-partition cores among agents to prevent OpenMP oversubscription.
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let per_agent = (cpus / agent_count).max(1);
+    tracing::debug!(
+        "Auto OMP threads: {} cores / {} agents = {} threads each",
+        cpus,
+        agent_count,
+        per_agent
+    );
+    per_agent
 }
 
 // endregion

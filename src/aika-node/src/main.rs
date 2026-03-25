@@ -110,6 +110,12 @@ enum Role {
         /// Path to the Python interpreter to use for feature extraction (e.g. venv python)
         #[arg(long, default_value = "python3")]
         python: String,
+
+        /// Number of OpenMP/MKL threads per agent process.
+        /// 0 = auto-partition (total_cores / agent_count).
+        /// Prevents CPU oversubscription when PyTorch uses OpenMP.
+        #[arg(long, default_value = "0")]
+        omp_threads: usize,
     },
 
     /// Run as a worker agent (usually spawned by a local controller)
@@ -137,6 +143,12 @@ enum Role {
         /// Path to the Python interpreter to use for feature extraction (e.g. venv python)
         #[arg(long, default_value = "python3")]
         python: String,
+
+        /// Number of OpenMP/MKL threads for the Python feature extractor per agent.
+        /// Controls CPU core partitioning when running multiple agents per node.
+        /// 0 = let PyTorch use its default (all cores).
+        #[arg(long, default_value = "0")]
+        omp_threads: usize,
     },
 }
 
@@ -200,6 +212,7 @@ async fn main() -> anyhow::Result<()> {
             extractor_script,
             image_base_path,
             python,
+            omp_threads,
         } => {
             let config = local_controller::LocalControllerConfig {
                 node_id,
@@ -210,6 +223,7 @@ async fn main() -> anyhow::Result<()> {
                 extractor_script,
                 image_base_path,
                 python,
+                omp_threads,
             };
             local_controller::run(config).await
         }
@@ -221,6 +235,7 @@ async fn main() -> anyhow::Result<()> {
             extractor_script,
             image_base_path,
             python,
+            omp_threads,
         } => {
             let config = agent::AgentConfig {
                 agent_id,
@@ -229,6 +244,7 @@ async fn main() -> anyhow::Result<()> {
                 extractor_script,
                 image_base_path,
                 python,
+                omp_threads,
             };
             agent::run(config).await
         }

@@ -11,6 +11,9 @@ pub struct AgentConfig {
     pub extractor_script: String,
     pub image_base_path: String,
     pub python: String,
+    /// Number of OpenMP/MKL threads for the Python feature extractor.
+    /// 0 = let PyTorch use its default (all cores).
+    pub omp_threads: usize,
 }
 
 /// Main entry point for the agent worker.
@@ -258,6 +261,7 @@ async fn process_batch(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .envs(omp_env(config.omp_threads))
         .spawn()
         .map_err(|e| anyhow::anyhow!("Failed to spawn {}: {}", config.python, e))?;
 
@@ -335,6 +339,25 @@ async fn heartbeat_loop(
             tracing::warn!("Heartbeat error: {}", e);
         }
     }
+}
+
+// endregion
+
+// region OpenMP environment
+
+/// Build environment variables that cap intra-op parallelism for the Python
+/// feature extractor.  When `omp_threads` is 0 the variables are not set and
+/// PyTorch / OpenMP will use their defaults (typically all cores).
+fn omp_env(omp_threads: usize) -> Vec<(&'static str, String)> {
+    if omp_threads == 0 {
+        return Vec::new();
+    }
+    let s = omp_threads.to_string();
+    vec![
+        ("OMP_NUM_THREADS", s.clone()),
+        ("MKL_NUM_THREADS", s.clone()),
+        ("TORCH_NUM_THREADS", s),
+    ]
 }
 
 // endregion

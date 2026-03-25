@@ -25,7 +25,7 @@ use std::time::Duration;
 const VERSION: &str = "v0.0.1"; // replaced by CI at release
 
 const NUM_CC: usize = 3;
-const AGENTS_PER_LC: usize = 4;
+const AGENTS_PER_LC: usize = 2;
 
 const IMAGE_DIR: &str = "/share/inf3203/unlabeled_images";
 
