@@ -7,7 +7,7 @@ monitoring and restarting failed nodes.
 Both the Áika node and deploy/watchdog scripts are written in Rust. A GitHub CI/CD pipeline builds static binaries to
 be used on the IFI cluster nodes.
 
-**Version:** v0.0.27
+**Version:** v0.0.28
 
 ---
 
@@ -18,7 +18,7 @@ be used on the IFI cluster nodes.
 > cluster node can reach via NFS — no per-node download needed.
 
 ```bash
-curl -fsSL https://github.com/augustsh/inf3203/releases/download/v0.0.27/deploy-x86_64-unknown-linux-musl.tar.gz | tar xz
+curl -fsSL https://github.com/augustsh/inf3203/releases/download/v0.0.28/deploy-x86_64-unknown-linux-musl.tar.gz | tar xz
 chmod +x deploy
 ./deploy N        # N = total cluster nodes (minimum 3)
 ```
@@ -37,7 +37,7 @@ The deploy binary:
 
 - **Local Controllers**: restarted after a 150-second delay (giving the CC time to promote the replica first). Always
     restarts as a standby replica. If the node is fully down we restart on a different node.
-- **Cluster Controllers**: restarted on the same node without wiping Raft state (no dynamic join/leave in Raft implementation).
+- **Cluster Controllers**: restarted on the same node with Raft state intact (term, voted_for, log). The leader sends only the missing tail entries to catch the rejoining CC up.
 
 ### Check status
 
@@ -174,6 +174,7 @@ Non-leader CCs return `307 Temporary Redirect` to the leader.
 | POST   | `/agent/complete`     | Proxied to CC leader                   |
 | POST   | `/agent/heartbeat`    | Agent liveness (local only)            |
 | POST   | `/activate`           | CC instructs replica to boot up agents |
+| POST   | `/deactivate`         | CC instructs active LC to kill agents and become replica |
 
 ---
 
