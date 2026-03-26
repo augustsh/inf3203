@@ -7,7 +7,7 @@ monitoring and restarting failed nodes.
 Both the Áika node and deploy/watchdog scripts are written in Rust. A GitHub CI/CD pipeline builds static binaries to
 be used on the IFI cluster nodes.
 
-**Version:** v0.0.22
+**Version:** v0.0.23
 
 ---
 
@@ -18,7 +18,7 @@ be used on the IFI cluster nodes.
 > cluster node can reach via NFS — no per-node download needed.
 
 ```bash
-curl -fsSL https://github.com/augustsh/inf3203/releases/download/v0.0.22/deploy-x86_64-unknown-linux-musl.tar.gz | tar xz
+curl -fsSL https://github.com/augustsh/inf3203/releases/download/v0.0.23/deploy-x86_64-unknown-linux-musl.tar.gz | tar xz
 chmod +x deploy
 ./deploy N        # N = total cluster nodes (minimum 3)
 ```
