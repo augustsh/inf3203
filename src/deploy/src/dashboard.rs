@@ -162,7 +162,7 @@ fn adjust_field(config: &mut StartupConfig, field: StartupField, up: bool, max_n
         }
         StartupField::AgentsPerLC => {
             if up {
-                config.agents_per_lc = (config.agents_per_lc + 1).min(8);
+                config.agents_per_lc = (config.agents_per_lc + 1).min(32);
             } else {
                 config.agents_per_lc = config.agents_per_lc.saturating_sub(1).max(1);
             }
@@ -554,19 +554,6 @@ fn tui_loop(
                                 }
                             }
                         }
-                        KeyCode::Char('a') | KeyCode::Char('A') => {
-                            let info_guard = deploy_info.lock().unwrap();
-                            if let Some(di) = info_guard.as_ref() {
-                                if total_nodes > 0
-                                    && tui.selected_node >= di.cc_nodes.len()
-                                {
-                                    let hostname =
-                                        node_hostname(di, tui.selected_node);
-                                    drop(info_guard);
-                                    kill_one_agent(&hostname, log_buf);
-                                }
-                            }
-                        }
                         KeyCode::Char('r') | KeyCode::Char('R') => {
                             if tui.show_results {
                                 // Toggle off.
@@ -586,7 +573,13 @@ fn tui_loop(
                                     send_start_signal(&di.cc_addrs, log_buf);
                                     tui.cluster_started = true;
                                     // Start the timer now.
-                                    state.lock().unwrap().start_time = Some(std::time::Instant::now());
+                                    let now_unix = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs();
+                                    let mut s = state.lock().unwrap();
+                                    s.start_time = Some(std::time::Instant::now());
+                                    s.start_time_unix = Some(now_unix);
                                 }
                             }
                         }
@@ -1269,13 +1262,6 @@ fn draw_footer(f: &mut Frame, area: Rect, tui: &TuiState) {
         ),
         Span::raw(" kill node  "),
         Span::styled(
-            "a",
-            Style::default()
-                .fg(Color::Red)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" kill agent  "),
-        Span::styled(
             "r",
             Style::default()
                 .fg(Color::Yellow)
@@ -1470,93 +1456,6 @@ fn kill_node(hostname: &str, log_buf: &LogBuffer) {
     });
 }
 
-/// Kill one agent process on the given LC hostname (oldest agent first).
-fn kill_one_agent(hostname: &str, log_buf: &LogBuffer) {
-    let hostname = hostname.to_string();
-    let log_buf = log_buf.clone();
-    std::thread::spawn(move || {
-        log_buf.push(format!("⚡ Killing one agent on {}…", hostname));
-
-        // Count agents before kill.
-        let before = count_agents_on(&hostname);
-
-        // Find the oldest agent process (by PID, lowest = oldest) and kill it.
-        // Agents are spawned via current_exe() which resolves the symlink to
-        // the real binary name (aika-node), so match on --agent-id flag instead.
-        let result = std::process::Command::new("ssh")
-            .args([
-                "-n",
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ConnectTimeout=5",
-                "-o",
-                "StrictHostKeyChecking=no",
-                &hostname,
-            ])
-            .arg("pgrep -f '[-]-agent-id' | head -1 | xargs -r kill")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        match result {
-            Ok(s) if s.success() => {
-                // Brief wait to let the kill take effect.
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                let after = count_agents_on(&hostname);
-                log_buf.push(format!(
-                    "⚡ Killed agent on {} (agents: {} → {})",
-                    hostname, before, after
-                ));
-                // Wait for LC to respawn, then report.
-                std::thread::sleep(std::time::Duration::from_secs(5));
-                let recovered = count_agents_on(&hostname);
-                if recovered > after {
-                    log_buf.push(format!(
-                        "↻ LC on {} respawned agent (agents: {} → {})",
-                        hostname, after, recovered
-                    ));
-                } else if recovered == after {
-                    log_buf.push(format!(
-                        "⚠ Agent on {} not respawned yet (still {})",
-                        hostname, recovered
-                    ));
-                }
-            }
-            Ok(_) => {
-                log_buf.push(format!(
-                    "⚡ No agent processes on {} (already dead?)",
-                    hostname
-                ));
-            }
-            Err(e) => {
-                log_buf.push(format!("⚡ SSH to {} failed: {}", hostname, e));
-            }
-        }
-    });
-}
-
-/// Count the number of agent processes running on a remote host.
-fn count_agents_on(hostname: &str) -> u32 {
-    let output = std::process::Command::new("ssh")
-        .args([
-            "-n",
-            "-o", "BatchMode=yes",
-            "-o", "ConnectTimeout=5",
-            "-o", "StrictHostKeyChecking=no",
-            hostname,
-        ])
-        .arg("pgrep -fc '[-]-agent-id' || true")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output();
-    match output {
-        Ok(o) => String::from_utf8_lossy(&o.stdout)
-            .trim()
-            .parse()
-            .unwrap_or(0),
-        Err(_) => 0,
-    }
-}
 
 /// Read results NDJSON files, deduplicate by batch_id, and count images per label.
 fn load_results(results_dir: &str) -> Vec<(String, u64)> {

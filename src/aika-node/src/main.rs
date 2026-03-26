@@ -80,6 +80,18 @@ enum Role {
         /// Allows deployer to wait for all nodes to come up before processing begins.
         #[arg(long)]
         hold: bool,
+
+        /// Target number of active (non-replica) local controllers to maintain.
+        /// When active_count < this value and idle replicas exist, the leader will
+        /// promote a replica. 0 = disabled (no rebalancing).
+        #[arg(long, default_value = "0")]
+        target_active_lc_count: usize,
+
+        /// Number of agents to spawn when promoting a replica to active.
+        /// Mirrors the agents_per_lc setting used at deploy time.
+        /// 0 = use 1 agent as fallback.
+        #[arg(long, default_value = "0")]
+        agents_per_lc: usize,
     },
 
     /// Run as a local controller (monitors agents on this physical node)
@@ -182,6 +194,8 @@ async fn main() -> anyhow::Result<()> {
             election_timeout_max_ms,
             max_images,
             hold,
+            target_active_lc_count,
+            agents_per_lc,
         } => {
             let username = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
             let data_dir =
@@ -206,6 +220,8 @@ async fn main() -> anyhow::Result<()> {
                 election_timeout_max_ms,
                 max_images,
                 hold,
+                target_active_lc_count,
+                agents_per_lc,
             };
             cluster_controller::run(config).await
         }

@@ -42,6 +42,42 @@ const GPU_NODE_PATTERNS: &[&str] = &["RTX", "Quadro", "GTX"];
 
 // region Helpers
 
+/// Priority order for node selection: c11 (0) > c9 (1) > c8 (2) > c7 (3) > other (4).
+fn node_priority(hostname: &str) -> u8 {
+    if hostname.starts_with("c11-") { 0 }
+    else if hostname.starts_with("c9-") { 1 }
+    else if hostname.starts_with("c8-") { 2 }
+    else if hostname.starts_with("c7-") { 3 }
+    else { 4 }
+}
+
+/// Sort candidates by priority group (c11 first), shuffling within each group.
+/// Also filters out the local deploy node to avoid deploying to ourselves.
+fn prioritize_nodes(mut candidates: Vec<String>, rng: &mut impl rand::Rng) -> Vec<String> {
+    // Determine and filter out the local hostname.
+    let local = Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if !local.is_empty() {
+        candidates.retain(|n| n != &local);
+    }
+
+    // Group by priority, shuffle each group, then concatenate.
+    let mut groups: [Vec<String>; 5] = Default::default();
+    for node in candidates {
+        groups[node_priority(&node) as usize].push(node);
+    }
+    let mut result = Vec::new();
+    for group in &mut groups {
+        group.shuffle(rng);
+        result.extend(group.drain(..));
+    }
+    result
+}
+
 /// Parse `/share/ifi/list-cluster-static.sh` and return a list of nodes with GPUs
 fn gpu_node_hostnames() -> std::collections::HashSet<String> {
     let output = Command::new("/share/ifi/list-cluster-static.sh")
@@ -388,6 +424,10 @@ fn main() {
         lc_replacements: 0,
         throughput_history: Vec::new(),
         per_node_history: HashMap::new(),
+        ttl_history: Vec::new(),
+        fault_events: Vec::new(),
+        config_snapshot: None,
+        start_time_unix: None,
         last_status: None,
         start_time: None,
         completed_at: None,
@@ -414,6 +454,8 @@ fn main() {
     if let Err(e) = dashboard::run_tui(dashboard_state, deploy_info, log_buf) {
         eprintln!("TUI error: {}", e);
     }
+    // Kill all cluster processes when the dashboard exits.
+    run_teardown(&cwd);
 }
 
 /// Runs the deploy sequence in a background thread: downloads binaries,
@@ -427,7 +469,7 @@ fn run_deploy(
     task_ttl_secs: u64,
     batch_size: usize,
     max_images: u64,
-    mut candidates: Vec<String>,
+    candidates: Vec<String>,
     log_buf: LogBuffer,
     deploy_info: Arc<Mutex<Option<DeployInfo>>>,
     dashboard_state: Arc<Mutex<DashboardState>>,
@@ -462,8 +504,34 @@ fn run_deploy(
     fs::create_dir_all(&log_dir).expect("failed to create logs dir");
     let log_dir_str = log_dir.to_str().expect("non-UTF8 path").to_string();
 
+    // Clear stale logs and result files from previous runs (keep telemetry_*.json).
+    let mut cleared = 0usize;
+    if let Ok(entries) = fs::read_dir(&log_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("log") {
+                let _ = fs::remove_file(&path);
+                cleared += 1;
+            }
+        }
+    }
+    if let Ok(entries) = fs::read_dir(&results_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name.starts_with("results_") && name.ends_with(".ndjson") {
+                    let _ = fs::remove_file(&path);
+                    cleared += 1;
+                }
+            }
+        }
+    }
+    if cleared > 0 {
+        log_buf.push(format!("[deploy] Cleared {} stale log/result files from previous run.", cleared));
+    }
+
     let mut rng = rand::rng();
-    candidates.shuffle(&mut rng);
+    let candidates = prioritize_nodes(candidates, &mut rng);
 
     let nodes: Vec<String> = candidates.into_iter().take(num_nodes).collect();
     log_buf.push(format!(
@@ -504,20 +572,26 @@ fn run_deploy(
     for (i, (node, port)) in cc_assignments.iter().enumerate() {
         let node_id = i + 1;
         let data_dir = format!("/tmp/inf3203_{}_{}", username, node_id);
+        // Restart args do NOT include --hold: a restarted CC should rejoin immediately
+        // without waiting for POST /start (which was already sent during initial deploy).
+        let target_active_lc_count = lc_nodes.len().saturating_sub(num_replicas);
         let node_args = format!(
             "cluster-controller --node-id {} --bind 0.0.0.0:{} --peers {} --image-dir {} \
              --data-dir {} --results-dir {} \
              --batch-size {} --task-ttl-secs {} \
              --heartbeat-interval-ms 200 --election-timeout-min-ms 1000 --election-timeout-max-ms 3000 \
-             --lc-heartbeat-timeout-secs 15 \
-             --max-images {} --hold",
+             --lc-heartbeat-timeout-secs 6 \
+             --max-images {} \
+             --target-active-lc-count {} --agents-per-lc {}",
             node_id, port, peer_list, IMAGE_DIR, data_dir, results_dir_str,
-            batch_size, task_ttl_secs, max_images
+            batch_size, task_ttl_secs, max_images,
+            target_active_lc_count, agents_per_lc
         );
         let log_file = format!("{}/cc-{}.log", log_dir_str, node_id);
-        // Wipe old Raft state on the target node (start fresh every time we deploy new cluster)
+        // Wipe old Raft state on the target node (start fresh every time we deploy new cluster).
+        // Initial start uses --hold; restarts (in watchdog) do not.
         let cmd = format!(
-            "rm -rf {} ; nohup {} {} </dev/null >>{} 2>&1 &",
+            "rm -rf {} ; nohup {} {} --hold </dev/null >>{} 2>&1 &",
             data_dir, binary_str, node_args, log_file
         );
         if ssh_run(node, &cmd) {
@@ -659,9 +733,19 @@ fn run_deploy(
             .collect();
 
         {
+            let num_active = lc_nodes.len().saturating_sub(num_replicas);
             let mut d = dashboard_state.lock().unwrap();
             d.cc_statuses = initial_cc_statuses;
-            d.telemetry_file = format!("{}/telemetry.json", results_dir_str);
+            d.telemetry_file = format!("{}/telemetry_{}.json", results_dir_str, timestamp_str());
+            d.config_snapshot = Some(ConfigSnapshot {
+                num_cc,
+                num_lc: lc_nodes.len(),
+                active_lc: num_active,
+                replica_lc: num_replicas,
+                agents_per_lc,
+                batch_size,
+                task_ttl_secs,
+            });
         }
         *deploy_info.lock().unwrap() = Some(info);
 
@@ -814,6 +898,24 @@ struct CcNodeStatus {
     is_leader: bool,
 }
 
+/// A timestamped fault event (node crash, restart, or replacement).
+struct FaultEvent {
+    ts: u64,
+    kind: &'static str, // "lc_crash" | "lc_restart" | "lc_replacement" | "cc_crash" | "cc_restart"
+    node: String,
+}
+
+/// Snapshot of the deployment configuration for telemetry output.
+struct ConfigSnapshot {
+    num_cc: usize,
+    num_lc: usize,
+    active_lc: usize,
+    replica_lc: usize,
+    agents_per_lc: usize,
+    batch_size: usize,
+    task_ttl_secs: u64,
+}
+
 /// Dashboard state accumulated across polling cycles.
 struct DashboardState {
     lc_crashes: u32,
@@ -825,6 +927,14 @@ struct DashboardState {
     throughput_history: Vec<(u64, u64)>,
     /// Per-node image history: node_id -> Vec<(unix_timestamp, images_total)>.
     per_node_history: HashMap<String, Vec<(u64, u64)>>,
+    /// History of (unix_timestamp, cumulative_ttl_expirations).
+    ttl_history: Vec<(u64, u64)>,
+    /// Timestamped fault events (crashes, restarts, replacements).
+    fault_events: Vec<FaultEvent>,
+    /// Deployment config snapshot (set after deploy completes).
+    config_snapshot: Option<ConfigSnapshot>,
+    /// Unix timestamp when the cluster was started (user pressed 's').
+    start_time_unix: Option<u64>,
     last_status: Option<StatusResponse>,
     /// Set when the user presses 's' (start). `None` means timer not started yet.
     start_time: Option<std::time::Instant>,
@@ -848,38 +958,90 @@ fn save_telemetry(state: &DashboardState, path: &str) {
         .duration_since(state.start_time.unwrap_or_else(std::time::Instant::now))
         .as_secs_f64();
 
+    let total_images = state.last_status.as_ref().map_or(0, |s| s.telemetry.completed_images);
+
+    // Global throughput: avg and max from throughput_history consecutive pairs.
+    let global_avg = if elapsed > 0.0 { total_images as f64 / elapsed } else { 0.0 };
+    let global_max = state.throughput_history
+        .windows(2)
+        .filter_map(|w| {
+            let dt = w[1].0.saturating_sub(w[0].0);
+            let dc = w[1].1.saturating_sub(w[0].1);
+            if dt == 0 { return None; }
+            // completed_tasks → multiply by batch_size for image rate
+            let batch_size = state.last_status.as_ref().map_or(1, |s| s.telemetry.batch_size.max(1));
+            Some(dc as f64 * batch_size as f64 / dt as f64)
+        })
+        .fold(0.0f64, f64::max);
+
+    // Per-node throughput stats from per_node_history.
+    let per_node_stats: HashMap<String, serde_json::Value> = state.per_node_history.iter()
+        .map(|(node, hist)| {
+            let rates: Vec<f64> = hist.windows(2)
+                .filter_map(|w| {
+                    let dt = w[1].0.saturating_sub(w[0].0);
+                    let dc = w[1].1.saturating_sub(w[0].1);
+                    if dt == 0 { return None; }
+                    Some(dc as f64 / dt as f64)
+                })
+                .collect();
+            let avg = if rates.is_empty() { 0.0 }
+                else { rates.iter().sum::<f64>() / rates.len() as f64 };
+            let min = rates.iter().cloned().fold(f64::MAX, f64::min);
+            let max = rates.iter().cloned().fold(0.0f64, f64::max);
+            let stats = serde_json::json!({
+                "avg_imgs_per_sec": avg,
+                "min_imgs_per_sec": if rates.is_empty() { 0.0 } else { min },
+                "max_imgs_per_sec": max,
+            });
+            (node.clone(), stats)
+        })
+        .collect();
+
     let data = serde_json::json!({
-        "elapsed_secs": elapsed,
-        "throughput_history": state.throughput_history.iter()
-            .map(|(t, c)| serde_json::json!({"ts": t, "completed": c}))
+        "config": state.config_snapshot.as_ref().map(|c| serde_json::json!({
+            "num_cc": c.num_cc,
+            "num_lc": c.num_lc,
+            "active_lc": c.active_lc,
+            "replica_lc": c.replica_lc,
+            "agents_per_lc": c.agents_per_lc,
+            "batch_size": c.batch_size,
+            "task_ttl_secs": c.task_ttl_secs,
+        })),
+        "run": {
+            "start_time_unix": state.start_time_unix,
+            "elapsed_secs": elapsed,
+            "total_images": state.last_status.as_ref().map_or(0, |s| s.telemetry.total_images),
+            "completed_images": total_images,
+        },
+        "throughput": {
+            "global_avg_imgs_per_sec": global_avg,
+            "global_max_imgs_per_sec": global_max,
+            "history": state.throughput_history.iter()
+                .map(|(t, c)| {
+                    let batch_size = state.last_status.as_ref()
+                        .map_or(1, |s| s.telemetry.batch_size.max(1));
+                    serde_json::json!({"ts": t, "completed_images": c * batch_size as u64})
+                })
+                .collect::<Vec<_>>(),
+        },
+        "per_node": per_node_stats,
+        "ttl_expirations": {
+            "total": state.last_status.as_ref().map_or(0, |s| s.telemetry.ttl_expirations),
+            "history": state.ttl_history.iter()
+                .map(|(t, v)| serde_json::json!({"ts": t, "total": v}))
+                .collect::<Vec<_>>(),
+        },
+        "fault_events": state.fault_events.iter()
+            .map(|e| serde_json::json!({"ts": e.ts, "type": e.kind, "node": e.node}))
             .collect::<Vec<_>>(),
-        "per_node_history": state.per_node_history.iter()
-            .map(|(node, hist)| (node.clone(), hist.iter()
-                .map(|(t, c)| serde_json::json!({"ts": t, "images": c}))
-                .collect::<Vec<_>>()))
-            .collect::<HashMap<_, _>>(),
-        "fault_tolerance": {
+        "fault_summary": {
             "lc_crashes": state.lc_crashes,
             "lc_restarts": state.lc_restarts,
             "cc_crashes": state.cc_crashes,
             "cc_restarts": state.cc_restarts,
             "lc_replacements": state.lc_replacements,
         },
-        "final_status": state.last_status.as_ref().map(|s| serde_json::json!({
-            "total_tasks": s.total_tasks,
-            "completed_tasks": s.completed_tasks,
-            "telemetry": serde_json::json!({
-                "total_images": s.telemetry.total_images,
-                "completed_images": s.telemetry.completed_images,
-                "ttl_expirations": s.telemetry.ttl_expirations,
-                "total_assignments": s.telemetry.total_assignments,
-                "total_completions": s.telemetry.total_completions,
-                "per_node_images": s.telemetry.per_node_images,
-                "per_node_completions": s.telemetry.per_node_completions,
-                "per_node_ttl_expirations": s.telemetry.per_node_ttl_expirations,
-                "batch_size": s.telemetry.batch_size,
-            }),
-        })),
     });
 
     if let Ok(mut f) = std::fs::File::create(path) {
@@ -970,6 +1132,74 @@ fn fmt_num(n: u64) -> String {
     result.chars().rev().collect()
 }
 
+/// Format current UTC time as "YYYYMMDD_HHMMSS" from a unix timestamp.
+fn timestamp_str() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    // Manual UTC breakdown (no DST, no external crate needed).
+    let s = secs % 60;
+    let m = (secs / 60) % 60;
+    let h = (secs / 3600) % 24;
+    // Days since epoch → approximate year/month/day.
+    let days = secs / 86400;
+    let mut year = 1970u32;
+    let mut rem = days;
+    loop {
+        let dy = if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) { 366 } else { 365 };
+        if rem < dy { break; }
+        rem -= dy;
+        year += 1;
+    }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let month_days = [31u32, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut month = 1u32;
+    for &md in &month_days {
+        if rem < md as u64 { break; }
+        rem -= md as u64;
+        month += 1;
+    }
+    let day = rem + 1;
+    format!("{:04}{:02}{:02}_{:02}{:02}{:02}", year, month, day, h, m, s)
+}
+
+/// Unix timestamp in seconds (used by watchdog fault event logging).
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// SSH to every previously-deployed node and kill all inf3203 processes.
+/// Runs after the dashboard exits to clean up the cluster.
+fn run_teardown(cwd: &Path) {
+    let nodes_file = cwd.join(".inf3203_nodes");
+    let content = match fs::read_to_string(&nodes_file) {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("[teardown] No node list found ({}) — skipping teardown.", nodes_file.display());
+            return;
+        }
+    };
+    let nodes: Vec<String> = content.lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if nodes.is_empty() {
+        return;
+    }
+    eprintln!("[teardown] Killing inf3203_aika on {} nodes…", nodes.len());
+    let handles: Vec<_> = nodes.into_iter().map(|node| {
+        thread::spawn(move || {
+            ssh_run(&node, "pkill -f '[i]nf3203_aika'; true");
+        })
+    }).collect();
+    for h in handles { let _ = h.join(); }
+    eprintln!("[teardown] Done.");
+}
+
 /// Response from GET /leader on a CC node.
 #[derive(serde::Deserialize)]
 struct LeaderResponse {
@@ -1045,6 +1275,11 @@ fn telemetry_poller(
                     history.remove(0);
                 }
             }
+            // Record TTL expiration history.
+            d.ttl_history.push((now, status.telemetry.ttl_expirations));
+            if d.ttl_history.len() > MAX_HISTORY {
+                d.ttl_history.remove(0);
+            }
             // Freeze the timer when all tasks are completed.
             if d.completed_at.is_none()
                 && status.total_tasks > 0
@@ -1079,7 +1314,7 @@ fn cc_monitor(
     dashboard: Arc<Mutex<DashboardState>>,
     log_buf: LogBuffer,
 ) {
-    const INTERVAL_SECS: u64 = 10;
+    const INTERVAL_SECS: u64 = 5;
     let mut was_down: Vec<bool> = vec![false; cc_entries.len()];
 
     log_buf.push(format!(
@@ -1099,23 +1334,21 @@ fn cc_monitor(
             // Only count the crash once per episode.
             if !was_down[i] {
                 was_down[i] = true;
-                dashboard.lock().unwrap().cc_crashes += 1;
+                let mut d = dashboard.lock().unwrap();
+                d.cc_crashes += 1;
+                d.fault_events.push(FaultEvent { ts: unix_now_secs(), kind: "cc_crash", node: node.clone() });
             }
             log_buf.push(format!("[watchdog] CC on {} not running — restarting…", node));
             let log_file = format!("{}/cc-{}.log", log_dir, node);
-            // Fire-and-forget: just launch the process. The pgrep check in
-            // the next cycle will confirm whether it actually started.
-            let cmd = format!(
-                "nohup {} {} </dev/null >>{} 2>&1 &",
-                binary, args, log_file
-            );
-            if ssh_run(node, &cmd) {
-                dashboard.lock().unwrap().cc_restarts += 1;
+            if ssh_start(node, binary, args, &log_file) {
+                let mut d = dashboard.lock().unwrap();
+                d.cc_restarts += 1;
+                d.fault_events.push(FaultEvent { ts: unix_now_secs(), kind: "cc_restart", node: node.clone() });
                 was_down[i] = false;
-                log_buf.push(format!("[watchdog] CC on {} restart launched", node));
+                log_buf.push(format!("[watchdog] CC on {} restarted ok", node));
             } else {
                 log_buf.push(format!(
-                    "[watchdog] CC on {} restart FAILED (SSH error)",
+                    "[watchdog] CC on {} restart FAILED (process not running after start)",
                     node
                 ));
             }
@@ -1131,9 +1364,9 @@ fn lc_monitor(
     dashboard: Arc<Mutex<DashboardState>>,
     log_buf: LogBuffer,
 ) {
-    const INTERVAL_SECS: u64 = 10;
-    // Must be > 2 × lc_heartbeat_timeout_secs (now 15s).
-    const RESTART_DELAY_SECS: u64 = 45;
+    const INTERVAL_SECS: u64 = 3;
+    // Must be > 2 × lc_heartbeat_timeout_secs (now 6s).
+    const RESTART_DELAY_SECS: u64 = 15;
     // Consecutive SSH failures before we give up and pick a replacement node.
     const MAX_RESTART_ATTEMPTS: u32 = 3;
 
@@ -1172,7 +1405,9 @@ fn lc_monitor(
 
             // Node is down — record when we first noticed.
             if entry.down_since.is_none() {
-                dashboard.lock().unwrap().lc_crashes += 1;
+                let mut d = dashboard.lock().unwrap();
+                d.lc_crashes += 1;
+                d.fault_events.push(FaultEvent { ts: unix_now_secs(), kind: "lc_crash", node: entry.node.clone() });
             }
             let first_down = entry.down_since.get_or_insert_with(std::time::Instant::now);
             let down_secs = first_down.elapsed().as_secs();
@@ -1208,7 +1443,10 @@ fn lc_monitor(
             let log_file = format!("{}/lc-{}.log", ctx.log_dir, entry.node);
             if ssh_start(&entry.node, &ctx.binary, &restart_args, &log_file) {
                 log_buf.push(format!("[watchdog] LC on {} restarted ok", entry.node));
-                dashboard.lock().unwrap().lc_restarts += 1;
+                let mut d = dashboard.lock().unwrap();
+                d.lc_restarts += 1;
+                d.fault_events.push(FaultEvent { ts: unix_now_secs(), kind: "lc_restart", node: entry.node.clone() });
+                drop(d);
                 entry.down_since = None;
                 entry.failed_attempts = 0;
                 continue;
@@ -1233,15 +1471,19 @@ fn lc_monitor(
                 .stdout(Stdio::piped())
                 .output();
             let candidates: Vec<String> = match raw {
-                Ok(o) => String::from_utf8_lossy(&o.stdout)
-                    .lines()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| {
-                        !s.is_empty()
-                            && !gpu_nodes.contains(s.as_str())
-                            && !known_nodes.contains(s.as_str())
-                    })
-                    .collect(),
+                Ok(o) => {
+                    let mut rng = rand::rng();
+                    let raw_list: Vec<String> = String::from_utf8_lossy(&o.stdout)
+                        .lines()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| {
+                            !s.is_empty()
+                                && !gpu_nodes.contains(s.as_str())
+                                && !known_nodes.contains(s.as_str())
+                        })
+                        .collect();
+                    prioritize_nodes(raw_list, &mut rng)
+                },
                 Err(e) => {
                     log_buf.push(format!("[watchdog] Could not query available nodes: {}", e));
                     continue;
@@ -1280,7 +1522,10 @@ fn lc_monitor(
             let log_file = format!("{}/lc-{}.log", ctx.log_dir, new_node);
             if ssh_start(&new_node, &ctx.binary, &new_restart_args, &log_file) {
                 log_buf.push(format!("[watchdog] Replacement LC on {} started ok", new_node));
-                dashboard.lock().unwrap().lc_replacements += 1;
+                let mut d = dashboard.lock().unwrap();
+                d.lc_replacements += 1;
+                d.fault_events.push(FaultEvent { ts: unix_now_secs(), kind: "lc_replacement", node: new_node.clone() });
+                drop(d);
                 entry.node = new_node;
                 entry.node_id = node_id;
                 entry.restart_args_template = new_restart_template;

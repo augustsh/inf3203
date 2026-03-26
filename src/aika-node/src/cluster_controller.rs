@@ -41,6 +41,12 @@ pub struct ClusterControllerConfig {
     pub max_images: u64,
     /// If true, hold task ingestion until POST /start is received.
     pub hold: bool,
+    /// Target number of active (agent_count > 0) local controllers to maintain.
+    /// The leader will promote idle replicas if active_count falls below this.
+    /// 0 = disabled.
+    pub target_active_lc_count: usize,
+    /// Agents to spawn when rebalancing promotes a replica. 0 = use 1 as fallback.
+    pub agents_per_lc: usize,
 }
 
 // endregion
@@ -332,6 +338,10 @@ struct AppState {
     results_dir: String,
     /// When `--hold` is set, this is false until POST /start is called.
     started: Arc<AtomicBool>,
+    /// Target active LC count for rebalancing. 0 = disabled.
+    target_active_lc_count: usize,
+    /// Agents per LC when promoting a replica during rebalancing.
+    agents_per_lc: usize,
 }
 
 // endregion
@@ -392,6 +402,8 @@ pub async fn run(config: ClusterControllerConfig) -> anyhow::Result<()> {
         node_id,
         results_dir,
         started: Arc::new(AtomicBool::new(!config.hold)),
+        target_active_lc_count: config.target_active_lc_count,
+        agents_per_lc: config.agents_per_lc,
     };
 
     // TTL reaper — only the leader acts, followers idle.
@@ -869,7 +881,7 @@ async fn ingest_image_tasks(
 ///
 /// State is cleared when this node loses leadership so the next leader starts fresh.
 async fn lc_monitor_loop(app: AppState) {
-    let interval = Duration::from_secs(10);
+    let interval = Duration::from_secs(3);
     let client = reqwest::Client::new();
     // node_id -> unix timestamp when it first exceeded the timeout (stage 1)
     let mut suspected_since: HashMap<String, u64> = HashMap::new();
@@ -972,6 +984,54 @@ async fn lc_monitor_loop(app: AppState) {
                     "No healthy standby replica found to replace failed LC {}",
                     node.node_id
                 );
+            }
+        }
+
+        // Rebalancing: if target_active_lc_count is configured and we have fewer
+        // active LCs than desired (e.g. after mass crash/restart), promote an idle
+        // replica to restore throughput.
+        if app.target_active_lc_count > 0 {
+            let active_count = nodes
+                .iter()
+                .filter(|n| n.agent_count > 0 && now.saturating_sub(n.last_heartbeat) < timeout)
+                .count();
+
+            if active_count < app.target_active_lc_count {
+                let promote_agents = app.agents_per_lc.max(1);
+                // Find a healthy idle replica not already delegated.
+                let replica = nodes.iter().find(|n| {
+                    n.agent_count == 0
+                        && now.saturating_sub(n.last_heartbeat) < timeout
+                        && !already_delegated.contains(&n.node_id)
+                });
+                if let Some(replica) = replica {
+                    tracing::info!(
+                        "Rebalancing: active={} < target={} — promoting replica {} ({} agents)",
+                        active_count, app.target_active_lc_count, replica.node_id, promote_agents
+                    );
+                    already_delegated.insert(replica.node_id.clone());
+                    let req = ActivateRequest {
+                        failed_node_id: "rebalance".to_string(),
+                        agent_count: promote_agents,
+                        extractor_script: replica.extractor_script.clone(),
+                        image_base_path: replica.image_base_path.clone(),
+                        python: replica.python.clone(),
+                    };
+                    let url = format!("http://{}/activate", replica.address);
+                    match client.post(&url).json(&req).send().await {
+                        Ok(resp) if resp.status().is_success() => {
+                            tracing::info!("Replica {} promoted for rebalancing", replica.node_id);
+                        }
+                        Ok(resp) => tracing::warn!(
+                            "Rebalance activation of {} returned status {}",
+                            replica.node_id, resp.status()
+                        ),
+                        Err(e) => tracing::warn!(
+                            "Rebalance activation of {} failed: {}",
+                            replica.node_id, e
+                        ),
+                    }
+                }
             }
         }
     }

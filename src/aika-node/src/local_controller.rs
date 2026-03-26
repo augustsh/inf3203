@@ -402,7 +402,7 @@ async fn agent_health_loop(app: AppState, interval_secs: u64) {
 /// Errors are logged and ignored — transient CC unavailability is expected.
 async fn heartbeat_loop(app: AppState) {
     loop {
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
 
         // Collect the data we need from state (brief lock, no I/O).
         let (
@@ -621,7 +621,12 @@ fn unix_now() -> u64 {
 ///
 /// - If `configured` > 0, use it as-is (explicit override).
 /// - If `configured` == 0 and `agent_count` <= 1, return 0 (let PyTorch use all cores).
-/// - If `configured` == 0 and `agent_count` > 1, auto-partition: total_cores / agent_count.
+/// - If `configured` == 0 and `agent_count` > 1, return 1 (one OMP thread per agent).
+///
+/// With multiple agents, throughput is driven by pipeline depth (overlapping NFS I/O,
+/// inference, and network phases), not intra-agent parallelism. Giving each agent
+/// multiple OMP threads adds fork/join overhead without benefit and discourages running
+/// more agents. One thread per agent maximises parallelism at the process level.
 fn effective_omp_threads(configured: usize, agent_count: usize) -> usize {
     if configured > 0 {
         return configured;
@@ -629,18 +634,7 @@ fn effective_omp_threads(configured: usize, agent_count: usize) -> usize {
     if agent_count <= 1 {
         return 0; // single agent — let it use all cores
     }
-    // Auto-partition cores among agents to prevent OpenMP oversubscription.
-    let cpus = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    let per_agent = (cpus / agent_count).max(1);
-    tracing::debug!(
-        "Auto OMP threads: {} cores / {} agents = {} threads each",
-        cpus,
-        agent_count,
-        per_agent
-    );
-    per_agent
+    1 // multiple agents: one OMP thread each, parallelism comes from pipeline overlap
 }
 
 // endregion
