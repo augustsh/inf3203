@@ -451,8 +451,15 @@ fn main() {
         });
     }
 
-    if let Err(e) = dashboard::run_tui(dashboard_state, deploy_info, log_buf) {
+    if let Err(e) = dashboard::run_tui(Arc::clone(&dashboard_state), deploy_info, log_buf) {
         eprintln!("TUI error: {}", e);
+    }
+    // Save telemetry on quit if it wasn't already saved on completion.
+    {
+        let d = dashboard_state.lock().unwrap();
+        if !d.telemetry_saved && !d.telemetry_file.is_empty() && d.start_time.is_some() {
+            save_telemetry(&d, &d.telemetry_file.clone());
+        }
     }
     // Kill all cluster processes when the dashboard exits.
     run_teardown(&cwd);
