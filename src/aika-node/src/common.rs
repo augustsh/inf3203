@@ -32,8 +32,13 @@ pub enum Command {
         labels: Vec<(String, String)>,
     },
 
-    /// TTL expired — return batch to pending
+    /// TTL expired — return batch to pending (single, kept for compatibility)
     ExpireTask { batch_id: u64 },
+
+    /// TTL expired for multiple batches at once — one Raft entry per reaper
+    /// cycle instead of one per expired batch, preventing proposal-channel
+    /// saturation when many assignments expire simultaneously.
+    ExpireTasks { batch_ids: Vec<u64> },
 
     /// Register a node (local controller) joining the cluster
     RegisterNode { node_id: String, address: String },

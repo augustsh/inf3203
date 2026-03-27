@@ -187,6 +187,22 @@ impl StateMachine {
                 }
             }
 
+            Command::ExpireTasks { batch_ids } => {
+                for batch_id in batch_ids {
+                    if let Some(batch) = self.tasks.get_mut(&batch_id) {
+                        if let TaskStatus::Assigned { ref agent_id, .. } = batch.status {
+                            *self
+                                .per_agent_ttl_expirations
+                                .entry(agent_id.clone())
+                                .or_insert(0) += 1;
+                            batch.status = TaskStatus::Pending;
+                            self.pending_queue.push_back(batch_id);
+                            self.ttl_expirations += 1;
+                        }
+                    }
+                }
+            }
+
             Command::RegisterNode { node_id, address } => {
                 self.nodes
                     .entry(node_id.clone())
@@ -712,17 +728,18 @@ async fn ttl_reaper_loop(app: AppState, ttl_secs: u64) {
                 "TTL reaper: {} batches expired (pending={} assigned={} queue_depth={} total_ttl_expirations={})",
                 expired.len(), pending_count, assigned_count, queue_depth, total_ttl + expired.len() as u64,
             );
+            // Propose all expirations as a single Raft entry so the propose
+            // channel is occupied for one round-trip, not N. Proposing them
+            // one-by-one at high expiry counts (100+) saturates the channel
+            // and stalls heartbeats and task assignments for tens of seconds.
+            if let Err(e) = app.raft.propose(Command::ExpireTasks { batch_ids: expired }).await {
+                tracing::warn!("Failed to propose ExpireTasks: {}", e);
+            }
         } else {
             tracing::debug!(
                 "TTL reaper: no expirations (pending={} assigned={} queue_depth={} total_ttl_expirations={})",
                 pending_count, assigned_count, queue_depth, total_ttl,
             );
-        }
-
-        for batch_id in expired {
-            if let Err(e) = app.raft.propose(Command::ExpireTask { batch_id }).await {
-                tracing::warn!("Failed to propose ExpireTask for batch {}: {}", batch_id, e);
-            }
         }
     }
 }

@@ -28,7 +28,10 @@ pub async fn run(config: AgentConfig) -> anyhow::Result<()> {
     );
 
     let config = Arc::new(config);
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
 
     // Shared slot: the work loop writes the current batch ID here so the
     // heartbeat loop can report it to the local controller.
@@ -77,7 +80,23 @@ async fn work_loop(
         *current_batch.lock().unwrap() = Some(assignment.batch_id);
 
         // 2. Process each image in the batch
-        let labels = process_batch(config, &assignment).await?;
+        let labels = match process_batch(config, &assignment).await {
+            Ok(labels) => labels,
+            Err(e) => {
+                tracing::error!(
+                    "Batch {} processing failed (will TTL-expire and be reassigned): {}",
+                    assignment.batch_id,
+                    e
+                );
+                // Clear the batch slot and loop back to request a new task.
+                // The current batch stays "Assigned" on the CC until its TTL
+                // expires and the reaper reclaims it. Exiting here would kill
+                // the agent process, causing unnecessary LC restart delay.
+                *current_batch.lock().unwrap() = None;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
 
         // Clear batch slot before reporting — the batch is no longer in-flight.
         *current_batch.lock().unwrap() = None;
