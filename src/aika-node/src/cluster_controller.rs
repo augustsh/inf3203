@@ -815,18 +815,12 @@ async fn ingest_image_tasks(
         return false;
     }
 
-    // Sort numerically when filenames are purely numeric (e.g. "1.JPEG", "200.JPEG").
-    // Lexicographic order on numeric names destroys NFS readahead locality:
-    // "1000000.JPEG" sorts before "2.JPEG", scattering inode accesses randomly.
-    // Numeric sort keeps files in creation order → sequential inode access → better cache.
-    names.sort_unstable_by(|a, b| {
-        let num_a = a.split('.').next().and_then(|s| s.parse::<u64>().ok());
-        let num_b = b.split('.').next().and_then(|s| s.parse::<u64>().ok());
-        match (num_a, num_b) {
-            (Some(na), Some(nb)) => na.cmp(&nb),
-            _ => a.cmp(b),
-        }
-    });
+    // Use filesystem order (no sort). The NFS directory returns files in the
+    // order they appear in the server's directory B-tree, which reflects the
+    // physical creation order. Files from the same extraction wave are adjacent
+    // → better inode locality and NFS cache behaviour than any filename-based
+    // sort. The directory is read-only during a run, so getdents() order is
+    // stable across all leaders reading from the same NFS server.
 
     // Limit the number of images if max_images is set.
     if max_images > 0 && names.len() > max_images as usize {
