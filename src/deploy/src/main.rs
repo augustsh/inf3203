@@ -188,7 +188,7 @@ fn ssh_start(node: &str, binary: &str, args: &str, log_file: &str) -> bool {
 
 /// Ensure a Python virtual environment with the required packages exists in
 /// `install_dir/inf3203_venv`. Returns the path to the venv's `python` binary.
-fn ensure_venv(install_dir: &Path, classify_script: &Path, log_buf: &LogBuffer) -> PathBuf {
+fn ensure_venv(install_dir: &Path, log_buf: &LogBuffer) -> PathBuf {
     let venv_dir = install_dir.join("inf3203_venv");
     let python = venv_dir.join("bin/python");
 
@@ -209,7 +209,7 @@ fn ensure_venv(install_dir: &Path, classify_script: &Path, log_buf: &LogBuffer) 
     }
 
     // Derive requirements.txt path: it lives next to classify.py
-    let requirements = classify_script.parent().unwrap_or(install_dir).join("requirements.txt");
+    let requirements = ensure_requirements_exists(install_dir, log_buf);
     if requirements.exists() {
         log_buf.push(format!("Installing packages from {}…", requirements.display()));
         let pip = venv_dir.join("bin/pip");
@@ -231,6 +231,36 @@ fn ensure_venv(install_dir: &Path, classify_script: &Path, log_buf: &LogBuffer) 
 
     log_buf.push(format!("venv ready: {}", python.display()));
     python
+}
+
+/// Ensure `requirements.txt` is present in `install_dir`. If not download from GitHub.
+fn ensure_requirements_exists(install_dir: &Path, log_buf: &LogBuffer) -> PathBuf {
+    let dest = install_dir.join("requirements.txt");
+    if dest.exists() {
+        log_buf.push(format!("requirements.txt already present: {}", dest.display()));
+        return dest;
+    }
+
+    let url = format!(
+        "https://github.com/augustsh/inf3203/releases/download/{}/requirements.txt",
+        VERSION
+    );
+    log_buf.push(format!("Downloading requirements.txt {}…", VERSION));
+
+    let status = Command::new("curl")
+        .args(["-fsS", "--no-progress-meter", "-L", "-o"])
+        .arg(&dest)
+        .arg(&url)
+        .status()
+        .expect("curl not found");
+
+    if !status.success() {
+        log_buf.push(format!("ERROR: Download failed: {}", url));
+        std::process::exit(1);
+    }
+
+    log_buf.push(format!("Installed: {}", dest.display()));
+    dest
 }
 
 /// Ensure `classify.py` is present in `install_dir`. If not download from GitHub.
@@ -493,7 +523,7 @@ fn run_deploy(
     let classify_script = ensure_classify_script(&cwd, &log_buf);
     let classify_script_str = classify_script.to_str().expect("non-UTF8 path");
 
-    let venv_python = ensure_venv(&cwd, &classify_script, &log_buf);
+    let venv_python = ensure_venv(&cwd, &log_buf);
     let venv_python_str = venv_python.to_str().expect("non-UTF8 path");
 
     // Create the results directory on the shared filesystem so all CC nodes can
