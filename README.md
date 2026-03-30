@@ -41,6 +41,9 @@ chmod +x deploy
 ./deploy        # starts the deploy dashboard where cluster configurations can be 
 ```
 
+Note: If the dashboard acts strange after setting up venv, try resizing the terminal window or restarting the deploy
+process to fix and graphical bugs.
+
 
 In the deploy dashboard:
 - Keybinds are at the bottom of the screen.
